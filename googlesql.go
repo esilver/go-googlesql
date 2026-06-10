@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/petermattis/goid"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
@@ -682,30 +683,19 @@ func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int6
 	return int64(ptr)<<32 | int64(len(resp))
 }
 
-// currentGID returns a stable per-goroutine identifier extracted
-// from runtime.Stack. The cost is small (a fixed-size buffer
-// scan + integer parse) and only matters during cross-goroutine
-// contention. Same-goroutine reentry never blocks so the cost
-// is not on the hot path.
+// currentGID returns a stable per-goroutine identifier. It is on
+// the hottest path in the package: callExport and exportFor each
+// consult it once per wasm RPC to detect same-goroutine reentry.
 func currentGID() int64 {
-	var buf [64]byte
-	n := runtime.Stack(buf[:], false)
-	// Stack output starts with "goroutine N [...".
-	const prefix = "goroutine "
-	s := string(buf[:n])
-	if !strings.HasPrefix(s, prefix) {
-		return 0
-	}
-	rest := s[len(prefix):]
-	id := int64(0)
-	for i := 0; i < len(rest); i++ {
-		c := rest[i]
-		if c < '0' || c > '9' {
-			break
-		}
-		id = id*10 + int64(c-'0')
-	}
-	return id
+	// goid.Get reads the goroutine id straight off the g struct
+	// (assembly fast path; runtime.Stack parse only as fallback on
+	// unsupported platforms). The previous runtime.Stack-based parse
+	// cost ~50-100us per call and, at two calls per wasm RPC with
+	// thousands of RPCs per GoogleSQL analysis, dominated the CPU
+	// profile of every analyze (54% of an end-to-end REST query in
+	// the bigquery-emulator stack — see
+	// esilver/googlesqlite issue 7).
+	return goid.Get()
 }
 
 // envStub returns a GoModuleFunction for an unresolved env import.
