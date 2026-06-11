@@ -466,17 +466,50 @@ var _ = strconv.Itoa
 // touches transpiled module state goes through m.invoke, and
 // m.invoke holds m.mu for the entire duration of its call. The
 // release window in handleCallback simply lets another m.invoke
-// grab the mutex and run as a fully nested top-level call — same
-// goroutine via the user handler, different goroutine via an
-// unrelated caller, it doesn't matter. Either way the nested call
-// enters, balances its own state changes, and exits before the
-// outer call resumes, so the outer call never observes a mid-flight
-// inner call.
+// grab the mutex and run as a fully nested call — same goroutine
+// via the user handler, different goroutine via an unrelated
+// caller. Either way the nested call enters, balances its own state
+// changes, and exits before the outer call resumes, so the outer
+// call never observes a mid-flight inner call.
+//
+// GC finalizers are the one exception to "just take m.mu"
+// (googlesqlite#16): the runtime-finalizer goroutine must never
+// block behind a long analysis, and a free must never execute while
+// another activation is suspended in handleCallback's release
+// window. free() therefore only appends to pendingFrees (guarded by
+// freeMu, never blocking on mu); the next TOP-LEVEL invoke — depth
+// 1, i.e. no activation suspended anywhere — drains the queue under
+// mu before running its own call.
+//
+// Wasm pointers are unsigned. Linear memory may legitimately grow
+// past 2 GiB (MaxMem is 4 GiB), at which point WasmAlloc returns
+// int32 values that are negative when misread as signed — every
+// slice of linear memory in this file converts through uint32
+// first. This was the actual googlesqlite#16 crash: invoke's
+// `Memory[reqPtr:]` with a negative reqPtr on the first request
+// buffer allocated above the 2 GiB line.
 type Module struct {
 	// mu serialises every entry into the transpiled module (invoke +
 	// nested re-entry from inside a callback handler).
 	mu sync.Mutex
 	g  *base.Module
+	// depth counts nested invoke activations; guarded by mu. It
+	// stays raised across handleCallback's release window, so a
+	// pending-free drain can only happen when no activation is
+	// suspended anywhere on any goroutine.
+	depth int
+	// lastGCNudgeMem is the linear-memory size (bytes) at the last
+	// forced collection; guarded by mu. m.Memory's backing array
+	// counts as live Go heap, so GOGC's doubling target lets
+	// un-finalized wasm-side garbage ratchet the heap upward each
+	// cycle — invoke forces a GC every gcNudgeBytes of growth so
+	// churn-heavy workloads stay far from the 4 GiB wall.
+	lastGCNudgeMem int
+	// freeMu guards pendingFrees and nothing else; it is never held
+	// while entering the module or taking mu, so finalizers cannot
+	// deadlock or stall behind module calls.
+	freeMu       sync.Mutex
+	pendingFrees []pendingFree
 	// cbMu guards callbacks and nextCBID. RWMutex because lookup in
 	// handleCallback is hot (every host-import dispatch) while
 	// Register/Unregister are rare (typically once per lifetime of a
@@ -539,7 +572,7 @@ func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int6
 	var req []byte
 	if reqLen > 0 {
 		buf := make([]byte, reqLen)
-		copy(buf, mem[reqPtr:reqPtr+reqLen])
+		copy(buf, mem[uint32(reqPtr):uint32(reqPtr)+uint32(reqLen)])
 		req = buf
 	}
 	// Release m.mu around the user handler so that nested calls
@@ -561,7 +594,7 @@ func (m *Module) handleCallback(callbackID, methodID, reqPtr, reqLen int32) int6
 		return 0
 	}
 	ptr := wasm2go.WasmAlloc(m.g, int32(len(resp)))
-	copy(wasm2go.Memory(m.g)[ptr:], resp)
+	copy(wasm2go.Memory(m.g)[uint32(ptr):], resp)
 	return int64(ptr)<<32 | int64(len(resp))
 }
 
@@ -601,6 +634,63 @@ func initModule() (retErr error) {
 	return nil
 }
 
+// pendingFree is a deferred wasm-side destructor call queued by a GC
+// finalizer. req is the already-serialized request (the handle); call
+// is the per-export wasm2go.Inv_<svc>_<mt> entry point of the free
+// method.
+type pendingFree struct {
+	serviceID int32
+	methodID  int32
+	req       []byte
+	call      func(*base.Module, int32, int32) (int64, error)
+}
+
+// enqueueFree records a wasm-side free to be executed by the next
+// top-level invoke. Called from runtime-finalizer context: it must
+// not take m.mu (a finalizer blocking behind a long analysis stalls
+// every finalizer in the process) and must not enter the transpiled
+// module (another activation may be suspended in handleCallback's
+// release window — entering would interleave with its frames).
+func (m *Module) enqueueFree(serviceID, methodID int32, req []byte, call func(*base.Module, int32, int32) (int64, error)) {
+	m.freeMu.Lock()
+	m.pendingFrees = append(m.pendingFrees, pendingFree{serviceID, methodID, req, call})
+	m.freeMu.Unlock()
+}
+
+// drainPendingFrees executes queued frees. Caller holds m.mu at depth
+// 1 (top level): no other activation exists anywhere, so each free
+// enters a fully-quiesced module. Loops because the runtime-finalizer
+// goroutine may append more frees concurrently between swaps.
+func (m *Module) drainPendingFrees() {
+	for {
+		m.freeMu.Lock()
+		frees := m.pendingFrees
+		m.pendingFrees = nil
+		m.freeMu.Unlock()
+		if len(frees) == 0 {
+			return
+		}
+		for _, f := range frees {
+			// Free errors were always ignored on the finalizer
+			// path; a trapped destructor must not poison the live
+			// call that happened to drain it.
+			_, _ = m.invokeLocked(f.serviceID, f.methodID, f.req, f.call)
+		}
+	}
+}
+
+// gcNudgeBytes is how much linear-memory growth invoke tolerates
+// before forcing a collection (see Module.lastGCNudgeMem).
+const gcNudgeBytes = 256 << 20
+
+func (m *Module) maybeNudgeGC() {
+	size := len(wasm2go.Memory(m.g))
+	if size-m.lastGCNudgeMem >= gcNudgeBytes {
+		m.lastGCNudgeMem = size
+		runtime.GC()
+	}
+}
+
 // invoke serializes req into wasm memory, runs the per-export caller
 // (wasm2go.Inv_<svc>_<mt>), and unpacks the (ptr<<32 | len) response.
 // call is the trap-safe per-export entry point: it snapshots and
@@ -609,6 +699,17 @@ func initModule() (retErr error) {
 func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.Module, int32, int32) (int64, error)) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.depth++
+	defer func() { m.depth-- }()
+	if m.depth == 1 {
+		m.maybeNudgeGC()
+		m.drainPendingFrees()
+	}
+	return m.invokeLocked(serviceID, methodID, req, call)
+}
+
+// invokeLocked is invoke's body; caller holds m.mu.
+func (m *Module) invokeLocked(serviceID, methodID int32, req []byte, call func(*base.Module, int32, int32) (int64, error)) ([]byte, error) {
 	var reqPtr, reqLen int32
 	if len(req) > 0 {
 		reqPtr = wasm2go.WasmAlloc(m.g, int32(len(req)))
@@ -621,7 +722,7 @@ func (m *Module) invoke(serviceID, methodID int32, req []byte, call func(*base.M
 		if reqPtr != 0 {
 			defer wasm2go.WasmFree(m.g, reqPtr)
 		}
-		copy(wasm2go.Memory(m.g)[reqPtr:], req)
+		copy(wasm2go.Memory(m.g)[uint32(reqPtr):], req)
 	}
 	packed, err := call(m.g, reqPtr, reqLen)
 	if err != nil {
@@ -646,7 +747,7 @@ func (m *Module) resolveTypeName(ptr uint64) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	reqPtr := wasm2go.WasmAlloc(m.g, int32(len(buf)))
-	copy(wasm2go.Memory(m.g)[reqPtr:], buf)
+	copy(wasm2go.Memory(m.g)[uint32(reqPtr):], buf)
 	packed := wasm2go.WasmifyGetTypeName(m.g, reqPtr, int32(len(buf)))
 	respPtr := uint32(packed >> 32)
 	respLen := uint32(packed & 0xFFFFFFFF)
@@ -51346,7 +51447,7 @@ func newASTAbortBatchStatementNoFinalizer(ptr uint64) *ASTAbortBatchStatement {
 func (h *ASTAbortBatchStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(12, 0, buf, wasm2go.Inv_12_0)
+		module().enqueueFree(12, 0, buf, wasm2go.Inv_12_0)
 		h.ptr = 0
 	}
 }
@@ -51436,7 +51537,7 @@ func (h *ASTAddColumnAction) SetIsIfNotExists(isIfNotExists bool) error {
 func (h *ASTAddColumnAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(13, 7, buf, wasm2go.Inv_13_7)
+		module().enqueueFree(13, 7, buf, wasm2go.Inv_13_7)
 		h.ptr = 0
 	}
 }
@@ -51519,7 +51620,7 @@ func (h *ASTAddColumnIdentifierAction) SetIsIfNotExists(isIfNotExists bool) erro
 func (h *ASTAddColumnIdentifierAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(14, 6, buf, wasm2go.Inv_14_6)
+		module().enqueueFree(14, 6, buf, wasm2go.Inv_14_6)
 		h.ptr = 0
 	}
 }
@@ -51590,7 +51691,7 @@ func (h *ASTAddConstraintAction) SetIsIfNotExists(isIfNotExists bool) error {
 func (h *ASTAddConstraintAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(15, 5, buf, wasm2go.Inv_15_5)
+		module().enqueueFree(15, 5, buf, wasm2go.Inv_15_5)
 		h.ptr = 0
 	}
 }
@@ -51679,7 +51780,7 @@ func (h *ASTAddSubEntityAction) Type() (*ASTIdentifier, error) {
 func (h *ASTAddSubEntityAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(16, 7, buf, wasm2go.Inv_16_7)
+		module().enqueueFree(16, 7, buf, wasm2go.Inv_16_7)
 		h.ptr = 0
 	}
 }
@@ -51741,7 +51842,7 @@ func (h *ASTAddToRestricteeListClause) SetIsIfNotExists(isIfNotExists bool) erro
 func (h *ASTAddToRestricteeListClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(17, 4, buf, wasm2go.Inv_17_4)
+		module().enqueueFree(17, 4, buf, wasm2go.Inv_17_4)
 		h.ptr = 0
 	}
 }
@@ -51803,7 +51904,7 @@ func (h *ASTAddTtlAction) SetIsIfNotExists(isIfNotExists bool) error {
 func (h *ASTAddTtlAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(18, 4, buf, wasm2go.Inv_18_4)
+		module().enqueueFree(18, 4, buf, wasm2go.Inv_18_4)
 		h.ptr = 0
 	}
 }
@@ -51846,7 +51947,7 @@ func (h *ASTAfterMatchSkipClause) TargetType() (ASTAfterMatchSkipClauseEnums_Aft
 func (h *ASTAfterMatchSkipClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(19, 2, buf, wasm2go.Inv_19_2)
+		module().enqueueFree(19, 2, buf, wasm2go.Inv_19_2)
 		h.ptr = 0
 	}
 }
@@ -51910,7 +52011,7 @@ func (h *ASTAlias) Identifier() (*ASTIdentifier, error) {
 func (h *ASTAlias) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(20, 4, buf, wasm2go.Inv_20_4)
+		module().enqueueFree(20, 4, buf, wasm2go.Inv_20_4)
 		h.ptr = 0
 	}
 }
@@ -51947,7 +52048,7 @@ func (h *ASTAliasedGroupRows) Alias() (*ASTIdentifier, error) {
 func (h *ASTAliasedGroupRows) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(21, 1, buf, wasm2go.Inv_21_1)
+		module().enqueueFree(21, 1, buf, wasm2go.Inv_21_1)
 		h.ptr = 0
 	}
 }
@@ -52001,7 +52102,7 @@ func (h *ASTAliasedQuery) Query() (*ASTQuery, error) {
 func (h *ASTAliasedQuery) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(22, 3, buf, wasm2go.Inv_22_3)
+		module().enqueueFree(22, 3, buf, wasm2go.Inv_22_3)
 		h.ptr = 0
 	}
 }
@@ -52047,7 +52148,7 @@ func (h *ASTAliasedQueryExpression) Query() (*ASTQuery, error) {
 func (h *ASTAliasedQueryExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(23, 2, buf, wasm2go.Inv_23_2)
+		module().enqueueFree(23, 2, buf, wasm2go.Inv_23_2)
 		h.ptr = 0
 	}
 }
@@ -52084,7 +52185,7 @@ func (h *ASTAliasedQueryList) AliasedQueryList(i int32) (*ASTAliasedQuery, error
 func (h *ASTAliasedQueryList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(24, 1, buf, wasm2go.Inv_24_1)
+		module().enqueueFree(24, 1, buf, wasm2go.Inv_24_1)
 		h.ptr = 0
 	}
 }
@@ -52120,7 +52221,7 @@ func (h *ASTAliasedQueryModifiers) RecursionDepthModifier() (*ASTRecursionDepthM
 func (h *ASTAliasedQueryModifiers) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(25, 1, buf, wasm2go.Inv_25_1)
+		module().enqueueFree(25, 1, buf, wasm2go.Inv_25_1)
 		h.ptr = 0
 	}
 }
@@ -52159,7 +52260,7 @@ func (h *ASTAlterAction) GetSQLForAlterAction() (string, error) {
 func (h *ASTAlterAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(26, 1, buf, wasm2go.Inv_26_1)
+		module().enqueueFree(26, 1, buf, wasm2go.Inv_26_1)
 		h.ptr = 0
 	}
 }
@@ -52196,7 +52297,7 @@ func (h *ASTAlterActionList) Actions(i int32) (ASTAlterActionNode, error) {
 func (h *ASTAlterActionList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(27, 1, buf, wasm2go.Inv_27_1)
+		module().enqueueFree(27, 1, buf, wasm2go.Inv_27_1)
 		h.ptr = 0
 	}
 }
@@ -52241,7 +52342,7 @@ func (h *ASTAlterAllRowAccessPoliciesStatement) TableNamePath() (*ASTPathExpress
 func (h *ASTAlterAllRowAccessPoliciesStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(28, 2, buf, wasm2go.Inv_28_2)
+		module().enqueueFree(28, 2, buf, wasm2go.Inv_28_2)
 		h.ptr = 0
 	}
 }
@@ -52268,7 +52369,7 @@ func newASTAlterApproxViewStatementNoFinalizer(ptr uint64) *ASTAlterApproxViewSt
 func (h *ASTAlterApproxViewStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(29, 0, buf, wasm2go.Inv_29_0)
+		module().enqueueFree(29, 0, buf, wasm2go.Inv_29_0)
 		h.ptr = 0
 	}
 }
@@ -52339,7 +52440,7 @@ func (h *ASTAlterColumnDropDefaultAction) SetIsIfExists(isIfExists bool) error {
 func (h *ASTAlterColumnDropDefaultAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(30, 5, buf, wasm2go.Inv_30_5)
+		module().enqueueFree(30, 5, buf, wasm2go.Inv_30_5)
 		h.ptr = 0
 	}
 }
@@ -52410,7 +52511,7 @@ func (h *ASTAlterColumnDropGeneratedAction) SetIsIfExists(isIfExists bool) error
 func (h *ASTAlterColumnDropGeneratedAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(31, 5, buf, wasm2go.Inv_31_5)
+		module().enqueueFree(31, 5, buf, wasm2go.Inv_31_5)
 		h.ptr = 0
 	}
 }
@@ -52481,7 +52582,7 @@ func (h *ASTAlterColumnDropNotNullAction) SetIsIfExists(isIfExists bool) error {
 func (h *ASTAlterColumnDropNotNullAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(32, 5, buf, wasm2go.Inv_32_5)
+		module().enqueueFree(32, 5, buf, wasm2go.Inv_32_5)
 		h.ptr = 0
 	}
 }
@@ -52561,7 +52662,7 @@ func (h *ASTAlterColumnOptionsAction) SetIsIfExists(isIfExists bool) error {
 func (h *ASTAlterColumnOptionsAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(33, 6, buf, wasm2go.Inv_33_6)
+		module().enqueueFree(33, 6, buf, wasm2go.Inv_33_6)
 		h.ptr = 0
 	}
 }
@@ -52641,7 +52742,7 @@ func (h *ASTAlterColumnSetDefaultAction) SetIsIfExists(isIfExists bool) error {
 func (h *ASTAlterColumnSetDefaultAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(34, 6, buf, wasm2go.Inv_34_6)
+		module().enqueueFree(34, 6, buf, wasm2go.Inv_34_6)
 		h.ptr = 0
 	}
 }
@@ -52721,7 +52822,7 @@ func (h *ASTAlterColumnSetGeneratedAction) SetIsIfExists(isIfExists bool) error 
 func (h *ASTAlterColumnSetGeneratedAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(35, 6, buf, wasm2go.Inv_35_6)
+		module().enqueueFree(35, 6, buf, wasm2go.Inv_35_6)
 		h.ptr = 0
 	}
 }
@@ -52810,7 +52911,7 @@ func (h *ASTAlterColumnTypeAction) SetIsIfExists(isIfExists bool) error {
 func (h *ASTAlterColumnTypeAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(36, 7, buf, wasm2go.Inv_36_7)
+		module().enqueueFree(36, 7, buf, wasm2go.Inv_36_7)
 		h.ptr = 0
 	}
 }
@@ -52843,7 +52944,7 @@ func newASTAlterConnectionStatementNoFinalizer(ptr uint64) *ASTAlterConnectionSt
 func (h *ASTAlterConnectionStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(37, 0, buf, wasm2go.Inv_37_0)
+		module().enqueueFree(37, 0, buf, wasm2go.Inv_37_0)
 		h.ptr = 0
 	}
 }
@@ -52930,7 +53031,7 @@ func (h *ASTAlterConstraintEnforcementAction) SetIsIfExists(isIfExists bool) err
 func (h *ASTAlterConstraintEnforcementAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(38, 7, buf, wasm2go.Inv_38_7)
+		module().enqueueFree(38, 7, buf, wasm2go.Inv_38_7)
 		h.ptr = 0
 	}
 }
@@ -53010,7 +53111,7 @@ func (h *ASTAlterConstraintSetOptionsAction) SetIsIfExists(isIfExists bool) erro
 func (h *ASTAlterConstraintSetOptionsAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(39, 6, buf, wasm2go.Inv_39_6)
+		module().enqueueFree(39, 6, buf, wasm2go.Inv_39_6)
 		h.ptr = 0
 	}
 }
@@ -53037,7 +53138,7 @@ func newASTAlterDatabaseStatementNoFinalizer(ptr uint64) *ASTAlterDatabaseStatem
 func (h *ASTAlterDatabaseStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(40, 0, buf, wasm2go.Inv_40_0)
+		module().enqueueFree(40, 0, buf, wasm2go.Inv_40_0)
 		h.ptr = 0
 	}
 }
@@ -53073,7 +53174,7 @@ func (h *ASTAlterEntityStatement) Type() (*ASTIdentifier, error) {
 func (h *ASTAlterEntityStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(41, 1, buf, wasm2go.Inv_41_1)
+		module().enqueueFree(41, 1, buf, wasm2go.Inv_41_1)
 		h.ptr = 0
 	}
 }
@@ -53100,7 +53201,7 @@ func newASTAlterExternalSchemaStatementNoFinalizer(ptr uint64) *ASTAlterExternal
 func (h *ASTAlterExternalSchemaStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(42, 0, buf, wasm2go.Inv_42_0)
+		module().enqueueFree(42, 0, buf, wasm2go.Inv_42_0)
 		h.ptr = 0
 	}
 }
@@ -53155,7 +53256,7 @@ func (h *ASTAlterIndexStatement) TableName() (*ASTPathExpression, error) {
 func (h *ASTAlterIndexStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(43, 3, buf, wasm2go.Inv_43_3)
+		module().enqueueFree(43, 3, buf, wasm2go.Inv_43_3)
 		h.ptr = 0
 	}
 }
@@ -53182,7 +53283,7 @@ func newASTAlterMaterializedViewStatementNoFinalizer(ptr uint64) *ASTAlterMateri
 func (h *ASTAlterMaterializedViewStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(44, 0, buf, wasm2go.Inv_44_0)
+		module().enqueueFree(44, 0, buf, wasm2go.Inv_44_0)
 		h.ptr = 0
 	}
 }
@@ -53209,7 +53310,7 @@ func newASTAlterModelStatementNoFinalizer(ptr uint64) *ASTAlterModelStatement {
 func (h *ASTAlterModelStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(45, 0, buf, wasm2go.Inv_45_0)
+		module().enqueueFree(45, 0, buf, wasm2go.Inv_45_0)
 		h.ptr = 0
 	}
 }
@@ -53256,7 +53357,7 @@ func (h *ASTAlterPrivilegeRestrictionStatement) Privileges() (*ASTPrivileges, er
 func (h *ASTAlterPrivilegeRestrictionStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(46, 2, buf, wasm2go.Inv_46_2)
+		module().enqueueFree(46, 2, buf, wasm2go.Inv_46_2)
 		h.ptr = 0
 	}
 }
@@ -53293,7 +53394,7 @@ func (h *ASTAlterRowAccessPolicyStatement) Name() (*ASTIdentifier, error) {
 func (h *ASTAlterRowAccessPolicyStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(47, 1, buf, wasm2go.Inv_47_1)
+		module().enqueueFree(47, 1, buf, wasm2go.Inv_47_1)
 		h.ptr = 0
 	}
 }
@@ -53320,7 +53421,7 @@ func newASTAlterSchemaStatementNoFinalizer(ptr uint64) *ASTAlterSchemaStatement 
 func (h *ASTAlterSchemaStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(48, 0, buf, wasm2go.Inv_48_0)
+		module().enqueueFree(48, 0, buf, wasm2go.Inv_48_0)
 		h.ptr = 0
 	}
 }
@@ -53351,7 +53452,7 @@ func newASTAlterSequenceStatementNoFinalizer(ptr uint64) *ASTAlterSequenceStatem
 func (h *ASTAlterSequenceStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(49, 0, buf, wasm2go.Inv_49_0)
+		module().enqueueFree(49, 0, buf, wasm2go.Inv_49_0)
 		h.ptr = 0
 	}
 }
@@ -53443,7 +53544,7 @@ func (h *ASTAlterStatementBase) SetIsIfExists(isIfExists bool) error {
 func (h *ASTAlterStatementBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(50, 7, buf, wasm2go.Inv_50_7)
+		module().enqueueFree(50, 7, buf, wasm2go.Inv_50_7)
 		h.ptr = 0
 	}
 }
@@ -53532,7 +53633,7 @@ func (h *ASTAlterSubEntityAction) Type() (*ASTIdentifier, error) {
 func (h *ASTAlterSubEntityAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(51, 7, buf, wasm2go.Inv_51_7)
+		module().enqueueFree(51, 7, buf, wasm2go.Inv_51_7)
 		h.ptr = 0
 	}
 }
@@ -53559,7 +53660,7 @@ func newASTAlterTableStatementNoFinalizer(ptr uint64) *ASTAlterTableStatement {
 func (h *ASTAlterTableStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(52, 0, buf, wasm2go.Inv_52_0)
+		module().enqueueFree(52, 0, buf, wasm2go.Inv_52_0)
 		h.ptr = 0
 	}
 }
@@ -53586,7 +53687,7 @@ func newASTAlterViewStatementNoFinalizer(ptr uint64) *ASTAlterViewStatement {
 func (h *ASTAlterViewStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(53, 0, buf, wasm2go.Inv_53_0)
+		module().enqueueFree(53, 0, buf, wasm2go.Inv_53_0)
 		h.ptr = 0
 	}
 }
@@ -53631,7 +53732,7 @@ func (h *ASTAnalyticFunctionCall) WindowSpec() (*ASTWindowSpecification, error) 
 func (h *ASTAnalyticFunctionCall) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(54, 2, buf, wasm2go.Inv_54_2)
+		module().enqueueFree(54, 2, buf, wasm2go.Inv_54_2)
 		h.ptr = 0
 	}
 }
@@ -53676,7 +53777,7 @@ func (h *ASTAnalyzeStatement) TableAndColumnInfoList() (*ASTTableAndColumnInfoLi
 func (h *ASTAnalyzeStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(55, 2, buf, wasm2go.Inv_55_2)
+		module().enqueueFree(55, 2, buf, wasm2go.Inv_55_2)
 		h.ptr = 0
 	}
 }
@@ -53722,7 +53823,7 @@ func (h *ASTAndExpr) Conjuncts(i int32) (ASTExpressionNode, error) {
 func (h *ASTAndExpr) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(56, 2, buf, wasm2go.Inv_56_2)
+		module().enqueueFree(56, 2, buf, wasm2go.Inv_56_2)
 		h.ptr = 0
 	}
 }
@@ -53783,7 +53884,7 @@ func (h *ASTAnySomeAllOp) SetOp(op ASTAnySomeAllOpEnums_Op) error {
 func (h *ASTAnySomeAllOp) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(57, 4, buf, wasm2go.Inv_57_4)
+		module().enqueueFree(57, 4, buf, wasm2go.Inv_57_4)
 		h.ptr = 0
 	}
 }
@@ -53810,7 +53911,7 @@ func newASTArrayColumnSchemaNoFinalizer(ptr uint64) *ASTArrayColumnSchema {
 func (h *ASTArrayColumnSchema) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(58, 0, buf, wasm2go.Inv_58_0)
+		module().enqueueFree(58, 0, buf, wasm2go.Inv_58_0)
 		h.ptr = 0
 	}
 }
@@ -53871,7 +53972,7 @@ func (h *ASTArrayConstructor) Type() (*ASTArrayType, error) {
 func (h *ASTArrayConstructor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(59, 3, buf, wasm2go.Inv_59_3)
+		module().enqueueFree(59, 3, buf, wasm2go.Inv_59_3)
 		h.ptr = 0
 	}
 }
@@ -53925,7 +54026,7 @@ func (h *ASTArrayElement) Position() (ASTExpressionNode, error) {
 func (h *ASTArrayElement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(60, 3, buf, wasm2go.Inv_60_3)
+		module().enqueueFree(60, 3, buf, wasm2go.Inv_60_3)
 		h.ptr = 0
 	}
 }
@@ -53979,7 +54080,7 @@ func (h *ASTArrayType) TypeParameters() (*ASTTypeParameterList, error) {
 func (h *ASTArrayType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(61, 3, buf, wasm2go.Inv_61_3)
+		module().enqueueFree(61, 3, buf, wasm2go.Inv_61_3)
 		h.ptr = 0
 	}
 }
@@ -54015,7 +54116,7 @@ func (h *ASTAssertRowsModified) NumRows() (ASTExpressionNode, error) {
 func (h *ASTAssertRowsModified) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(62, 1, buf, wasm2go.Inv_62_1)
+		module().enqueueFree(62, 1, buf, wasm2go.Inv_62_1)
 		h.ptr = 0
 	}
 }
@@ -54060,7 +54161,7 @@ func (h *ASTAssertStatement) Expr() (ASTExpressionNode, error) {
 func (h *ASTAssertStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(63, 2, buf, wasm2go.Inv_63_2)
+		module().enqueueFree(63, 2, buf, wasm2go.Inv_63_2)
 		h.ptr = 0
 	}
 }
@@ -54110,7 +54211,7 @@ func (h *ASTAssignmentFromStruct) Variables() (*ASTIdentifierList, error) {
 func (h *ASTAssignmentFromStruct) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(64, 2, buf, wasm2go.Inv_64_2)
+		module().enqueueFree(64, 2, buf, wasm2go.Inv_64_2)
 		h.ptr = 0
 	}
 }
@@ -54146,7 +54247,7 @@ func (h *ASTAuxLoadDataFromFilesOptionsList) OptionsList() (*ASTOptionsList, err
 func (h *ASTAuxLoadDataFromFilesOptionsList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(65, 1, buf, wasm2go.Inv_65_1)
+		module().enqueueFree(65, 1, buf, wasm2go.Inv_65_1)
 		h.ptr = 0
 	}
 }
@@ -54207,7 +54308,7 @@ func (h *ASTAuxLoadDataPartitionsClause) SetIsOverwrite(isOverwrite bool) error 
 func (h *ASTAuxLoadDataPartitionsClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(66, 4, buf, wasm2go.Inv_66_4)
+		module().enqueueFree(66, 4, buf, wasm2go.Inv_66_4)
 		h.ptr = 0
 	}
 }
@@ -54322,7 +54423,7 @@ func (h *ASTAuxLoadDataStatement) WithPartitionColumnsClause() (*ASTWithPartitio
 func (h *ASTAuxLoadDataStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(67, 10, buf, wasm2go.Inv_67_10)
+		module().enqueueFree(67, 10, buf, wasm2go.Inv_67_10)
 		h.ptr = 0
 	}
 }
@@ -54386,7 +54487,7 @@ func (h *ASTBeginEndBlock) StatementListNode() (*ASTStatementList, error) {
 func (h *ASTBeginEndBlock) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(68, 4, buf, wasm2go.Inv_68_4)
+		module().enqueueFree(68, 4, buf, wasm2go.Inv_68_4)
 		h.ptr = 0
 	}
 }
@@ -54423,7 +54524,7 @@ func (h *ASTBeginStatement) ModeList() (*ASTTransactionModeList, error) {
 func (h *ASTBeginStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(69, 1, buf, wasm2go.Inv_69_1)
+		module().enqueueFree(69, 1, buf, wasm2go.Inv_69_1)
 		h.ptr = 0
 	}
 }
@@ -54523,7 +54624,7 @@ func (h *ASTBetweenExpression) SetIsNot(isNot bool) error {
 func (h *ASTBetweenExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(70, 8, buf, wasm2go.Inv_70_8)
+		module().enqueueFree(70, 8, buf, wasm2go.Inv_70_8)
 		h.ptr = 0
 	}
 }
@@ -54559,7 +54660,7 @@ func (h *ASTBigNumericLiteral) StringLiteral() (*ASTStringLiteral, error) {
 func (h *ASTBigNumericLiteral) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(71, 1, buf, wasm2go.Inv_71_1)
+		module().enqueueFree(71, 1, buf, wasm2go.Inv_71_1)
 		h.ptr = 0
 	}
 }
@@ -54668,7 +54769,7 @@ func (h *ASTBinaryExpression) SetOp(op ASTBinaryExpressionEnums_Op) error {
 func (h *ASTBinaryExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(72, 9, buf, wasm2go.Inv_72_9)
+		module().enqueueFree(72, 9, buf, wasm2go.Inv_72_9)
 		h.ptr = 0
 	}
 }
@@ -54740,7 +54841,7 @@ func (h *ASTBitwiseShiftExpression) SetIsLeftShift(isLeftShift bool) error {
 func (h *ASTBitwiseShiftExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(73, 5, buf, wasm2go.Inv_73_5)
+		module().enqueueFree(73, 5, buf, wasm2go.Inv_73_5)
 		h.ptr = 0
 	}
 }
@@ -54783,7 +54884,7 @@ func (h *ASTBooleanLiteral) Value() (bool, error) {
 func (h *ASTBooleanLiteral) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(74, 2, buf, wasm2go.Inv_74_2)
+		module().enqueueFree(74, 2, buf, wasm2go.Inv_74_2)
 		h.ptr = 0
 	}
 }
@@ -54830,7 +54931,7 @@ func (h *ASTBoundedQuantifier) UpperBound() (*ASTQuantifierBound, error) {
 func (h *ASTBoundedQuantifier) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(75, 2, buf, wasm2go.Inv_75_2)
+		module().enqueueFree(75, 2, buf, wasm2go.Inv_75_2)
 		h.ptr = 0
 	}
 }
@@ -54867,7 +54968,7 @@ func (h *ASTBracedConstructor) Fields(i int32) (*ASTBracedConstructorField, erro
 func (h *ASTBracedConstructor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(76, 1, buf, wasm2go.Inv_76_1)
+		module().enqueueFree(76, 1, buf, wasm2go.Inv_76_1)
 		h.ptr = 0
 	}
 }
@@ -54932,7 +55033,7 @@ func (h *ASTBracedConstructorField) Value() (*ASTBracedConstructorFieldValue, er
 func (h *ASTBracedConstructorField) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(77, 4, buf, wasm2go.Inv_77_4)
+		module().enqueueFree(77, 4, buf, wasm2go.Inv_77_4)
 		h.ptr = 0
 	}
 }
@@ -54987,7 +55088,7 @@ func (h *ASTBracedConstructorFieldValue) SetColonPrefixed(colonPrefixed bool) er
 func (h *ASTBracedConstructorFieldValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(78, 3, buf, wasm2go.Inv_78_3)
+		module().enqueueFree(78, 3, buf, wasm2go.Inv_78_3)
 		h.ptr = 0
 	}
 }
@@ -55039,7 +55140,7 @@ func (h *ASTBracedConstructorLhs) SetOperation(operation ASTBracedConstructorLhs
 func (h *ASTBracedConstructorLhs) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(79, 3, buf, wasm2go.Inv_79_3)
+		module().enqueueFree(79, 3, buf, wasm2go.Inv_79_3)
 		h.ptr = 0
 	}
 }
@@ -55084,7 +55185,7 @@ func (h *ASTBracedNewConstructor) TypeName() (*ASTSimpleType, error) {
 func (h *ASTBracedNewConstructor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(80, 2, buf, wasm2go.Inv_80_2)
+		module().enqueueFree(80, 2, buf, wasm2go.Inv_80_2)
 		h.ptr = 0
 	}
 }
@@ -55150,7 +55251,7 @@ func (h *ASTBreakContinueStatement) SetKeyword(keyword ASTBreakContinueStatement
 func (h *ASTBreakContinueStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(81, 4, buf, wasm2go.Inv_81_4)
+		module().enqueueFree(81, 4, buf, wasm2go.Inv_81_4)
 		h.ptr = 0
 	}
 }
@@ -55193,7 +55294,7 @@ func (h *ASTBreakStatement) SetKeyword(keyword ASTBreakContinueStatementEnums_Br
 func (h *ASTBreakStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(82, 2, buf, wasm2go.Inv_82_2)
+		module().enqueueFree(82, 2, buf, wasm2go.Inv_82_2)
 		h.ptr = 0
 	}
 }
@@ -55249,7 +55350,7 @@ func (h *ASTBytesLiteral) SetBytesValue(bytesValue string) error {
 func (h *ASTBytesLiteral) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(83, 3, buf, wasm2go.Inv_83_3)
+		module().enqueueFree(83, 3, buf, wasm2go.Inv_83_3)
 		h.ptr = 0
 	}
 }
@@ -55294,7 +55395,7 @@ func (h *ASTBytesLiteralComponent) SetBytesValue(bytesValue string) error {
 func (h *ASTBytesLiteralComponent) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(84, 2, buf, wasm2go.Inv_84_2)
+		module().enqueueFree(84, 2, buf, wasm2go.Inv_84_2)
 		h.ptr = 0
 	}
 }
@@ -55340,7 +55441,7 @@ func (h *ASTCallStatement) ProcedureName() (*ASTPathExpression, error) {
 func (h *ASTCallStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(85, 2, buf, wasm2go.Inv_85_2)
+		module().enqueueFree(85, 2, buf, wasm2go.Inv_85_2)
 		h.ptr = 0
 	}
 }
@@ -55377,7 +55478,7 @@ func (h *ASTCaseNoValueExpression) Arguments(i int32) (ASTExpressionNode, error)
 func (h *ASTCaseNoValueExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(86, 1, buf, wasm2go.Inv_86_1)
+		module().enqueueFree(86, 1, buf, wasm2go.Inv_86_1)
 		h.ptr = 0
 	}
 }
@@ -55433,7 +55534,7 @@ func (h *ASTCaseStatement) WhenThenClauses() (*ASTWhenThenClauseList, error) {
 func (h *ASTCaseStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(87, 3, buf, wasm2go.Inv_87_3)
+		module().enqueueFree(87, 3, buf, wasm2go.Inv_87_3)
 		h.ptr = 0
 	}
 }
@@ -55470,7 +55571,7 @@ func (h *ASTCaseValueExpression) Arguments(i int32) (ASTExpressionNode, error) {
 func (h *ASTCaseValueExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(88, 1, buf, wasm2go.Inv_88_1)
+		module().enqueueFree(88, 1, buf, wasm2go.Inv_88_1)
 		h.ptr = 0
 	}
 }
@@ -55549,7 +55650,7 @@ func (h *ASTCastExpression) Type() (ASTTypeNode, error) {
 func (h *ASTCastExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(89, 6, buf, wasm2go.Inv_89_6)
+		module().enqueueFree(89, 6, buf, wasm2go.Inv_89_6)
 		h.ptr = 0
 	}
 }
@@ -55585,7 +55686,7 @@ func (h *ASTChainedBaseExpr) Expr() (ASTExpressionNode, error) {
 func (h *ASTChainedBaseExpr) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(90, 1, buf, wasm2go.Inv_90_1)
+		module().enqueueFree(90, 1, buf, wasm2go.Inv_90_1)
 		h.ptr = 0
 	}
 }
@@ -55664,7 +55765,7 @@ func (h *ASTCheckConstraint) SetIsEnforced(isEnforced bool) error {
 func (h *ASTCheckConstraint) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(91, 6, buf, wasm2go.Inv_91_6)
+		module().enqueueFree(91, 6, buf, wasm2go.Inv_91_6)
 		h.ptr = 0
 	}
 }
@@ -55709,7 +55810,7 @@ func (h *ASTClampedBetweenModifier) Low() (ASTExpressionNode, error) {
 func (h *ASTClampedBetweenModifier) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(92, 2, buf, wasm2go.Inv_92_2)
+		module().enqueueFree(92, 2, buf, wasm2go.Inv_92_2)
 		h.ptr = 0
 	}
 }
@@ -55736,7 +55837,7 @@ func newASTCloneDataSourceNoFinalizer(ptr uint64) *ASTCloneDataSource {
 func (h *ASTCloneDataSource) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(93, 0, buf, wasm2go.Inv_93_0)
+		module().enqueueFree(93, 0, buf, wasm2go.Inv_93_0)
 		h.ptr = 0
 	}
 }
@@ -55773,7 +55874,7 @@ func (h *ASTCloneDataSourceList) DataSources(i int32) (*ASTCloneDataSource, erro
 func (h *ASTCloneDataSourceList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(94, 1, buf, wasm2go.Inv_94_1)
+		module().enqueueFree(94, 1, buf, wasm2go.Inv_94_1)
 		h.ptr = 0
 	}
 }
@@ -55818,7 +55919,7 @@ func (h *ASTCloneDataStatement) TargetPath() (*ASTPathExpression, error) {
 func (h *ASTCloneDataStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(95, 2, buf, wasm2go.Inv_95_2)
+		module().enqueueFree(95, 2, buf, wasm2go.Inv_95_2)
 		h.ptr = 0
 	}
 }
@@ -55855,7 +55956,7 @@ func (h *ASTClusterBy) ClusteringExpressions(i int32) (ASTExpressionNode, error)
 func (h *ASTClusterBy) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(96, 1, buf, wasm2go.Inv_96_1)
+		module().enqueueFree(96, 1, buf, wasm2go.Inv_96_1)
 		h.ptr = 0
 	}
 }
@@ -55891,7 +55992,7 @@ func (h *ASTCollate) CollationName() (ASTExpressionNode, error) {
 func (h *ASTCollate) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(97, 1, buf, wasm2go.Inv_97_1)
+		module().enqueueFree(97, 1, buf, wasm2go.Inv_97_1)
 		h.ptr = 0
 	}
 }
@@ -55929,7 +56030,7 @@ func (h *ASTColumnAttribute) SingleNodeSqlString() (string, error) {
 func (h *ASTColumnAttribute) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(98, 1, buf, wasm2go.Inv_98_1)
+		module().enqueueFree(98, 1, buf, wasm2go.Inv_98_1)
 		h.ptr = 0
 	}
 }
@@ -55966,7 +56067,7 @@ func (h *ASTColumnAttributeList) Values(i int32) (ASTColumnAttributeNode, error)
 func (h *ASTColumnAttributeList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(99, 1, buf, wasm2go.Inv_99_1)
+		module().enqueueFree(99, 1, buf, wasm2go.Inv_99_1)
 		h.ptr = 0
 	}
 }
@@ -56011,7 +56112,7 @@ func (h *ASTColumnDefinition) Schema() (ASTColumnSchemaNode, error) {
 func (h *ASTColumnDefinition) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(100, 2, buf, wasm2go.Inv_100_2)
+		module().enqueueFree(100, 2, buf, wasm2go.Inv_100_2)
 		h.ptr = 0
 	}
 }
@@ -56048,7 +56149,7 @@ func (h *ASTColumnList) Identifiers(i int32) (*ASTIdentifier, error) {
 func (h *ASTColumnList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(101, 1, buf, wasm2go.Inv_101_1)
+		module().enqueueFree(101, 1, buf, wasm2go.Inv_101_1)
 		h.ptr = 0
 	}
 }
@@ -56109,7 +56210,7 @@ func (h *ASTColumnPosition) Type() (ASTColumnPositionEnums_RelativePositionType,
 func (h *ASTColumnPosition) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(102, 4, buf, wasm2go.Inv_102_4)
+		module().enqueueFree(102, 4, buf, wasm2go.Inv_102_4)
 		h.ptr = 0
 	}
 }
@@ -56218,7 +56319,7 @@ func (h *ASTColumnSchema) TypeParameters() (*ASTTypeParameterList, error) {
 func (h *ASTColumnSchema) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(103, 7, buf, wasm2go.Inv_103_7)
+		module().enqueueFree(103, 7, buf, wasm2go.Inv_103_7)
 		h.ptr = 0
 	}
 }
@@ -56263,7 +56364,7 @@ func (h *ASTColumnWithOptions) OptionsList() (*ASTOptionsList, error) {
 func (h *ASTColumnWithOptions) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(104, 2, buf, wasm2go.Inv_104_2)
+		module().enqueueFree(104, 2, buf, wasm2go.Inv_104_2)
 		h.ptr = 0
 	}
 }
@@ -56300,7 +56401,7 @@ func (h *ASTColumnWithOptionsList) ColumnWithOptions(i int32) (*ASTColumnWithOpt
 func (h *ASTColumnWithOptionsList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(105, 1, buf, wasm2go.Inv_105_1)
+		module().enqueueFree(105, 1, buf, wasm2go.Inv_105_1)
 		h.ptr = 0
 	}
 }
@@ -56328,7 +56429,7 @@ func newASTCommitStatementNoFinalizer(ptr uint64) *ASTCommitStatement {
 func (h *ASTCommitStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(106, 0, buf, wasm2go.Inv_106_0)
+		module().enqueueFree(106, 0, buf, wasm2go.Inv_106_0)
 		h.ptr = 0
 	}
 }
@@ -56366,7 +56467,7 @@ func (h *ASTConcatExpr) Operands(i int32) (ASTExpressionNode, error) {
 func (h *ASTConcatExpr) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(107, 1, buf, wasm2go.Inv_107_1)
+		module().enqueueFree(107, 1, buf, wasm2go.Inv_107_1)
 		h.ptr = 0
 	}
 }
@@ -56407,7 +56508,7 @@ func (h *ASTConnectionClause) ConnectionPath() (ASTExpressionNode, error) {
 func (h *ASTConnectionClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(108, 1, buf, wasm2go.Inv_108_1)
+		module().enqueueFree(108, 1, buf, wasm2go.Inv_108_1)
 		h.ptr = 0
 	}
 }
@@ -56450,7 +56551,7 @@ func (h *ASTContinueStatement) SetKeyword(keyword ASTBreakContinueStatementEnums
 func (h *ASTContinueStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(109, 2, buf, wasm2go.Inv_109_2)
+		module().enqueueFree(109, 2, buf, wasm2go.Inv_109_2)
 		h.ptr = 0
 	}
 }
@@ -56477,7 +56578,7 @@ func newASTCopyDataSourceNoFinalizer(ptr uint64) *ASTCopyDataSource {
 func (h *ASTCopyDataSource) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(110, 0, buf, wasm2go.Inv_110_0)
+		module().enqueueFree(110, 0, buf, wasm2go.Inv_110_0)
 		h.ptr = 0
 	}
 }
@@ -56504,7 +56605,7 @@ func newASTCreateApproxViewStatementNoFinalizer(ptr uint64) *ASTCreateApproxView
 func (h *ASTCreateApproxViewStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(111, 0, buf, wasm2go.Inv_111_0)
+		module().enqueueFree(111, 0, buf, wasm2go.Inv_111_0)
 		h.ptr = 0
 	}
 }
@@ -56565,7 +56666,7 @@ func (h *ASTCreateConnectionStatement) OptionsList() (*ASTOptionsList, error) {
 func (h *ASTCreateConnectionStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(112, 3, buf, wasm2go.Inv_112_3)
+		module().enqueueFree(112, 3, buf, wasm2go.Inv_112_3)
 		h.ptr = 0
 	}
 }
@@ -56628,7 +56729,7 @@ func (h *ASTCreateConstantStatement) Name() (*ASTPathExpression, error) {
 func (h *ASTCreateConstantStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(113, 3, buf, wasm2go.Inv_113_3)
+		module().enqueueFree(113, 3, buf, wasm2go.Inv_113_3)
 		h.ptr = 0
 	}
 }
@@ -56677,7 +56778,7 @@ func (h *ASTCreateDatabaseStatement) OptionsList() (*ASTOptionsList, error) {
 func (h *ASTCreateDatabaseStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(114, 2, buf, wasm2go.Inv_114_2)
+		module().enqueueFree(114, 2, buf, wasm2go.Inv_114_2)
 		h.ptr = 0
 	}
 }
@@ -56758,7 +56859,7 @@ func (h *ASTCreateEntityStatement) Type() (*ASTIdentifier, error) {
 func (h *ASTCreateEntityStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(115, 6, buf, wasm2go.Inv_115_6)
+		module().enqueueFree(115, 6, buf, wasm2go.Inv_115_6)
 		h.ptr = 0
 	}
 }
@@ -56802,7 +56903,7 @@ func (h *ASTCreateExternalSchemaStatement) WithConnectionClause() (*ASTWithConne
 func (h *ASTCreateExternalSchemaStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(116, 1, buf, wasm2go.Inv_116_1)
+		module().enqueueFree(116, 1, buf, wasm2go.Inv_116_1)
 		h.ptr = 0
 	}
 }
@@ -56838,7 +56939,7 @@ func (h *ASTCreateExternalTableStatement) WithPartitionColumnsClause() (*ASTWith
 func (h *ASTCreateExternalTableStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(117, 1, buf, wasm2go.Inv_117_1)
+		module().enqueueFree(117, 1, buf, wasm2go.Inv_117_1)
 		h.ptr = 0
 	}
 }
@@ -56941,7 +57042,7 @@ func (h *ASTCreateFunctionStatement) WithConnectionClause() (*ASTWithConnectionC
 func (h *ASTCreateFunctionStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(118, 8, buf, wasm2go.Inv_118_8)
+		module().enqueueFree(118, 8, buf, wasm2go.Inv_118_8)
 		h.ptr = 0
 	}
 }
@@ -57078,7 +57179,7 @@ func (h *ASTCreateFunctionStmtBase) SqlSecurity() (ASTCreateStatementEnums_SqlSe
 func (h *ASTCreateFunctionStmtBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(119, 12, buf, wasm2go.Inv_119_12)
+		module().enqueueFree(119, 12, buf, wasm2go.Inv_119_12)
 		h.ptr = 0
 	}
 }
@@ -57269,7 +57370,7 @@ func (h *ASTCreateIndexStatement) TableName() (*ASTPathExpression, error) {
 func (h *ASTCreateIndexStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(120, 19, buf, wasm2go.Inv_120_19)
+		module().enqueueFree(120, 19, buf, wasm2go.Inv_120_19)
 		h.ptr = 0
 	}
 }
@@ -57314,7 +57415,7 @@ func (h *ASTCreateLocalityGroupStatement) OptionsList() (*ASTOptionsList, error)
 func (h *ASTCreateLocalityGroupStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(121, 2, buf, wasm2go.Inv_121_2)
+		module().enqueueFree(121, 2, buf, wasm2go.Inv_121_2)
 		h.ptr = 0
 	}
 }
@@ -57368,7 +57469,7 @@ func (h *ASTCreateMaterializedViewStatement) ReplicaSource() (*ASTPathExpression
 func (h *ASTCreateMaterializedViewStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(122, 3, buf, wasm2go.Inv_122_3)
+		module().enqueueFree(122, 3, buf, wasm2go.Inv_122_3)
 		h.ptr = 0
 	}
 }
@@ -57498,7 +57599,7 @@ func (h *ASTCreateModelStatement) WithConnectionClause() (*ASTWithConnectionClau
 func (h *ASTCreateModelStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(123, 10, buf, wasm2go.Inv_123_10)
+		module().enqueueFree(123, 10, buf, wasm2go.Inv_123_10)
 		h.ptr = 0
 	}
 }
@@ -57570,7 +57671,7 @@ func (h *ASTCreatePrivilegeRestrictionStatement) RestrictTo() (*ASTRestrictToCla
 func (h *ASTCreatePrivilegeRestrictionStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(124, 5, buf, wasm2go.Inv_124_5)
+		module().enqueueFree(124, 5, buf, wasm2go.Inv_124_5)
 		h.ptr = 0
 	}
 }
@@ -57705,7 +57806,7 @@ func (h *ASTCreateProcedureStatement) WithConnectionClause() (*ASTWithConnection
 func (h *ASTCreateProcedureStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(125, 12, buf, wasm2go.Inv_125_12)
+		module().enqueueFree(125, 12, buf, wasm2go.Inv_125_12)
 		h.ptr = 0
 	}
 }
@@ -57781,7 +57882,7 @@ func (h *ASTCreatePropertyGraphStatement) OptionsList() (*ASTOptionsList, error)
 func (h *ASTCreatePropertyGraphStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(126, 5, buf, wasm2go.Inv_126_5)
+		module().enqueueFree(126, 5, buf, wasm2go.Inv_126_5)
 		h.ptr = 0
 	}
 }
@@ -57869,7 +57970,7 @@ func (h *ASTCreateRowAccessPolicyStatement) TargetPath() (*ASTPathExpression, er
 func (h *ASTCreateRowAccessPolicyStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(127, 7, buf, wasm2go.Inv_127_7)
+		module().enqueueFree(127, 7, buf, wasm2go.Inv_127_7)
 		h.ptr = 0
 	}
 }
@@ -57909,7 +58010,7 @@ func (h *ASTCreateSchemaStatement) Collate() (*ASTCollate, error) {
 func (h *ASTCreateSchemaStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(128, 1, buf, wasm2go.Inv_128_1)
+		module().enqueueFree(128, 1, buf, wasm2go.Inv_128_1)
 		h.ptr = 0
 	}
 }
@@ -57967,7 +58068,7 @@ func (h *ASTCreateSchemaStmtBase) OptionsList() (*ASTOptionsList, error) {
 func (h *ASTCreateSchemaStmtBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(129, 3, buf, wasm2go.Inv_129_3)
+		module().enqueueFree(129, 3, buf, wasm2go.Inv_129_3)
 		h.ptr = 0
 	}
 }
@@ -58028,7 +58129,7 @@ func (h *ASTCreateSequenceStatement) OptionsList() (*ASTOptionsList, error) {
 func (h *ASTCreateSequenceStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(130, 3, buf, wasm2go.Inv_130_3)
+		module().enqueueFree(130, 3, buf, wasm2go.Inv_130_3)
 		h.ptr = 0
 	}
 }
@@ -58109,7 +58210,7 @@ func (h *ASTCreateSnapshotStatement) SetSchemaObjectKind(schemaObjectKind Schema
 func (h *ASTCreateSnapshotStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(131, 6, buf, wasm2go.Inv_131_6)
+		module().enqueueFree(131, 6, buf, wasm2go.Inv_131_6)
 		h.ptr = 0
 	}
 }
@@ -58173,7 +58274,7 @@ func (h *ASTCreateSnapshotTableStatement) OptionsList() (*ASTOptionsList, error)
 func (h *ASTCreateSnapshotTableStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(132, 4, buf, wasm2go.Inv_132_4)
+		module().enqueueFree(132, 4, buf, wasm2go.Inv_132_4)
 		h.ptr = 0
 	}
 }
@@ -58312,7 +58413,7 @@ func (h *ASTCreateStatement) SetScope(scope ASTCreateStatementEnums_Scope) error
 func (h *ASTCreateStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(133, 12, buf, wasm2go.Inv_133_12)
+		module().enqueueFree(133, 12, buf, wasm2go.Inv_133_12)
 		h.ptr = 0
 	}
 }
@@ -58371,7 +58472,7 @@ func (h *ASTCreateTableFunctionStatement) ReturnTvfSchema() (*ASTTVFSchema, erro
 func (h *ASTCreateTableFunctionStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(134, 3, buf, wasm2go.Inv_134_3)
+		module().enqueueFree(134, 3, buf, wasm2go.Inv_134_3)
 		h.ptr = 0
 	}
 }
@@ -58461,7 +58562,7 @@ func (h *ASTCreateTableStatement) Ttl() (*ASTTtlClause, error) {
 func (h *ASTCreateTableStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(135, 7, buf, wasm2go.Inv_135_7)
+		module().enqueueFree(135, 7, buf, wasm2go.Inv_135_7)
 		h.ptr = 0
 	}
 }
@@ -58553,7 +58654,7 @@ func (h *ASTCreateTableStmtBase) WithConnectionClause() (*ASTWithConnectionClaus
 func (h *ASTCreateTableStmtBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(136, 7, buf, wasm2go.Inv_136_7)
+		module().enqueueFree(136, 7, buf, wasm2go.Inv_136_7)
 		h.ptr = 0
 	}
 }
@@ -58580,7 +58681,7 @@ func newASTCreateViewStatementNoFinalizer(ptr uint64) *ASTCreateViewStatement {
 func (h *ASTCreateViewStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(137, 0, buf, wasm2go.Inv_137_0)
+		module().enqueueFree(137, 0, buf, wasm2go.Inv_137_0)
 		h.ptr = 0
 	}
 }
@@ -58695,7 +58796,7 @@ func (h *ASTCreateViewStatementBase) SqlSecurity() (ASTCreateStatementEnums_SqlS
 func (h *ASTCreateViewStatementBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(138, 10, buf, wasm2go.Inv_138_10)
+		module().enqueueFree(138, 10, buf, wasm2go.Inv_138_10)
 		h.ptr = 0
 	}
 }
@@ -58733,7 +58834,7 @@ func (h *ASTCube) Expressions(i int32) (ASTExpressionNode, error) {
 func (h *ASTCube) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(139, 1, buf, wasm2go.Inv_139_1)
+		module().enqueueFree(139, 1, buf, wasm2go.Inv_139_1)
 		h.ptr = 0
 	}
 }
@@ -58794,7 +58895,7 @@ func (h *ASTDateOrTimeLiteral) TypeKind() (TypeKind, error) {
 func (h *ASTDateOrTimeLiteral) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(140, 4, buf, wasm2go.Inv_140_4)
+		module().enqueueFree(140, 4, buf, wasm2go.Inv_140_4)
 		h.ptr = 0
 	}
 }
@@ -58842,7 +58943,7 @@ func (h *ASTDdlStatement) IsDdlStatement() (bool, error) {
 func (h *ASTDdlStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(141, 2, buf, wasm2go.Inv_141_2)
+		module().enqueueFree(141, 2, buf, wasm2go.Inv_141_2)
 		h.ptr = 0
 	}
 }
@@ -58871,7 +58972,7 @@ func newASTDefaultLiteralNoFinalizer(ptr uint64) *ASTDefaultLiteral {
 func (h *ASTDefaultLiteral) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(142, 0, buf, wasm2go.Inv_142_0)
+		module().enqueueFree(142, 0, buf, wasm2go.Inv_142_0)
 		h.ptr = 0
 	}
 }
@@ -58917,7 +59018,7 @@ func (h *ASTDefineMacroStatement) Name() (*ASTIdentifier, error) {
 func (h *ASTDefineMacroStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(143, 2, buf, wasm2go.Inv_143_2)
+		module().enqueueFree(143, 2, buf, wasm2go.Inv_143_2)
 		h.ptr = 0
 	}
 }
@@ -58962,7 +59063,7 @@ func (h *ASTDefineTableStatement) OptionsList() (*ASTOptionsList, error) {
 func (h *ASTDefineTableStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(144, 2, buf, wasm2go.Inv_144_2)
+		module().enqueueFree(144, 2, buf, wasm2go.Inv_144_2)
 		h.ptr = 0
 	}
 }
@@ -59076,7 +59177,7 @@ func (h *ASTDeleteStatement) Where() (ASTExpressionNode, error) {
 func (h *ASTDeleteStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(145, 9, buf, wasm2go.Inv_145_9)
+		module().enqueueFree(145, 9, buf, wasm2go.Inv_145_9)
 		h.ptr = 0
 	}
 }
@@ -59131,7 +59232,7 @@ func (h *ASTDescribeStatement) OptionalIdentifier() (*ASTIdentifier, error) {
 func (h *ASTDescribeStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(146, 3, buf, wasm2go.Inv_146_3)
+		module().enqueueFree(146, 3, buf, wasm2go.Inv_146_3)
 		h.ptr = 0
 	}
 }
@@ -59167,7 +59268,7 @@ func (h *ASTDescriptor) Columns() (*ASTDescriptorColumnList, error) {
 func (h *ASTDescriptor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(147, 1, buf, wasm2go.Inv_147_1)
+		module().enqueueFree(147, 1, buf, wasm2go.Inv_147_1)
 		h.ptr = 0
 	}
 }
@@ -59204,7 +59305,7 @@ func (h *ASTDescriptorColumn) Name() (*ASTIdentifier, error) {
 func (h *ASTDescriptorColumn) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(148, 1, buf, wasm2go.Inv_148_1)
+		module().enqueueFree(148, 1, buf, wasm2go.Inv_148_1)
 		h.ptr = 0
 	}
 }
@@ -59241,7 +59342,7 @@ func (h *ASTDescriptorColumnList) DescriptorColumnList(i int32) (*ASTDescriptorC
 func (h *ASTDescriptorColumnList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(149, 1, buf, wasm2go.Inv_149_1)
+		module().enqueueFree(149, 1, buf, wasm2go.Inv_149_1)
 		h.ptr = 0
 	}
 }
@@ -59289,7 +59390,7 @@ func (h *ASTDotGeneralizedField) Path() (*ASTPathExpression, error) {
 func (h *ASTDotGeneralizedField) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(150, 2, buf, wasm2go.Inv_150_2)
+		module().enqueueFree(150, 2, buf, wasm2go.Inv_150_2)
 		h.ptr = 0
 	}
 }
@@ -59337,7 +59438,7 @@ func (h *ASTDotIdentifier) Name() (*ASTIdentifier, error) {
 func (h *ASTDotIdentifier) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(151, 2, buf, wasm2go.Inv_151_2)
+		module().enqueueFree(151, 2, buf, wasm2go.Inv_151_2)
 		h.ptr = 0
 	}
 }
@@ -59373,7 +59474,7 @@ func (h *ASTDotStar) Expr() (ASTExpressionNode, error) {
 func (h *ASTDotStar) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(152, 1, buf, wasm2go.Inv_152_1)
+		module().enqueueFree(152, 1, buf, wasm2go.Inv_152_1)
 		h.ptr = 0
 	}
 }
@@ -59419,7 +59520,7 @@ func (h *ASTDotStarWithModifiers) Modifiers() (*ASTStarModifiers, error) {
 func (h *ASTDotStarWithModifiers) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(153, 2, buf, wasm2go.Inv_153_2)
+		module().enqueueFree(153, 2, buf, wasm2go.Inv_153_2)
 		h.ptr = 0
 	}
 }
@@ -59472,7 +59573,7 @@ func (h *ASTDropAllRowAccessPoliciesStatement) TableName() (*ASTPathExpression, 
 func (h *ASTDropAllRowAccessPoliciesStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(154, 3, buf, wasm2go.Inv_154_3)
+		module().enqueueFree(154, 3, buf, wasm2go.Inv_154_3)
 		h.ptr = 0
 	}
 }
@@ -59543,7 +59644,7 @@ func (h *ASTDropColumnAction) SetIsIfExists(isIfExists bool) error {
 func (h *ASTDropColumnAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(155, 5, buf, wasm2go.Inv_155_5)
+		module().enqueueFree(155, 5, buf, wasm2go.Inv_155_5)
 		h.ptr = 0
 	}
 }
@@ -59614,7 +59715,7 @@ func (h *ASTDropConstraintAction) SetIsIfExists(isIfExists bool) error {
 func (h *ASTDropConstraintAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(156, 5, buf, wasm2go.Inv_156_5)
+		module().enqueueFree(156, 5, buf, wasm2go.Inv_156_5)
 		h.ptr = 0
 	}
 }
@@ -59695,7 +59796,7 @@ func (h *ASTDropEntityStatement) SetIsIfExists(isIfExists bool) error {
 func (h *ASTDropEntityStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(157, 6, buf, wasm2go.Inv_157_6)
+		module().enqueueFree(157, 6, buf, wasm2go.Inv_157_6)
 		h.ptr = 0
 	}
 }
@@ -59776,7 +59877,7 @@ func (h *ASTDropFunctionStatement) SetIsIfExists(isIfExists bool) error {
 func (h *ASTDropFunctionStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(158, 6, buf, wasm2go.Inv_158_6)
+		module().enqueueFree(158, 6, buf, wasm2go.Inv_158_6)
 		h.ptr = 0
 	}
 }
@@ -59850,7 +59951,7 @@ func (h *ASTDropIndexStatement) TableName() (*ASTPathExpression, error) {
 func (h *ASTDropIndexStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(159, 5, buf, wasm2go.Inv_159_5)
+		module().enqueueFree(159, 5, buf, wasm2go.Inv_159_5)
 		h.ptr = 0
 	}
 }
@@ -59922,7 +60023,7 @@ func (h *ASTDropMaterializedViewStatement) SetIsIfExists(isIfExists bool) error 
 func (h *ASTDropMaterializedViewStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(160, 5, buf, wasm2go.Inv_160_5)
+		module().enqueueFree(160, 5, buf, wasm2go.Inv_160_5)
 		h.ptr = 0
 	}
 }
@@ -59984,7 +60085,7 @@ func (h *ASTDropPrimaryKeyAction) SetIsIfExists(isIfExists bool) error {
 func (h *ASTDropPrimaryKeyAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(161, 4, buf, wasm2go.Inv_161_4)
+		module().enqueueFree(161, 4, buf, wasm2go.Inv_161_4)
 		h.ptr = 0
 	}
 }
@@ -60063,7 +60164,7 @@ func (h *ASTDropPrivilegeRestrictionStatement) SetIsIfExists(isIfExists bool) er
 func (h *ASTDropPrivilegeRestrictionStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(162, 6, buf, wasm2go.Inv_162_6)
+		module().enqueueFree(162, 6, buf, wasm2go.Inv_162_6)
 		h.ptr = 0
 	}
 }
@@ -60144,7 +60245,7 @@ func (h *ASTDropRowAccessPolicyStatement) TableName() (*ASTPathExpression, error
 func (h *ASTDropRowAccessPolicyStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(163, 6, buf, wasm2go.Inv_163_6)
+		module().enqueueFree(163, 6, buf, wasm2go.Inv_163_6)
 		h.ptr = 0
 	}
 }
@@ -60182,7 +60283,7 @@ func (h *ASTDropSearchIndexStatement) SingleNodeDebugString() (string, error) {
 func (h *ASTDropSearchIndexStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(164, 1, buf, wasm2go.Inv_164_1)
+		module().enqueueFree(164, 1, buf, wasm2go.Inv_164_1)
 		h.ptr = 0
 	}
 }
@@ -60254,7 +60355,7 @@ func (h *ASTDropSnapshotTableStatement) SetIsIfExists(isIfExists bool) error {
 func (h *ASTDropSnapshotTableStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(165, 5, buf, wasm2go.Inv_165_5)
+		module().enqueueFree(165, 5, buf, wasm2go.Inv_165_5)
 		h.ptr = 0
 	}
 }
@@ -60358,7 +60459,7 @@ func (h *ASTDropStatement) SetSchemaObjectKind(schemaObjectKind SchemaObjectKind
 func (h *ASTDropStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(166, 9, buf, wasm2go.Inv_166_9)
+		module().enqueueFree(166, 9, buf, wasm2go.Inv_166_9)
 		h.ptr = 0
 	}
 }
@@ -60438,7 +60539,7 @@ func (h *ASTDropSubEntityAction) Type() (*ASTIdentifier, error) {
 func (h *ASTDropSubEntityAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(167, 6, buf, wasm2go.Inv_167_6)
+		module().enqueueFree(167, 6, buf, wasm2go.Inv_167_6)
 		h.ptr = 0
 	}
 }
@@ -60514,7 +60615,7 @@ func (h *ASTDropTableFunctionStatement) SetIsIfExists(isIfExists bool) error {
 func (h *ASTDropTableFunctionStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(168, 5, buf, wasm2go.Inv_168_5)
+		module().enqueueFree(168, 5, buf, wasm2go.Inv_168_5)
 		h.ptr = 0
 	}
 }
@@ -60567,7 +60668,7 @@ func (h *ASTDropTtlAction) SetIsIfExists(isIfExists bool) error {
 func (h *ASTDropTtlAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(169, 3, buf, wasm2go.Inv_169_3)
+		module().enqueueFree(169, 3, buf, wasm2go.Inv_169_3)
 		h.ptr = 0
 	}
 }
@@ -60605,7 +60706,7 @@ func (h *ASTDropVectorIndexStatement) SingleNodeDebugString() (string, error) {
 func (h *ASTDropVectorIndexStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(170, 1, buf, wasm2go.Inv_170_1)
+		module().enqueueFree(170, 1, buf, wasm2go.Inv_170_1)
 		h.ptr = 0
 	}
 }
@@ -60645,7 +60746,7 @@ func (h *ASTElementTypeColumnSchema) ElementSchema() (ASTColumnSchemaNode, error
 func (h *ASTElementTypeColumnSchema) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(171, 1, buf, wasm2go.Inv_171_1)
+		module().enqueueFree(171, 1, buf, wasm2go.Inv_171_1)
 		h.ptr = 0
 	}
 }
@@ -60702,7 +60803,7 @@ func (h *ASTElseifClause) IfStmt() (*ASTIfStatement, error) {
 func (h *ASTElseifClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(172, 3, buf, wasm2go.Inv_172_3)
+		module().enqueueFree(172, 3, buf, wasm2go.Inv_172_3)
 		h.ptr = 0
 	}
 }
@@ -60742,7 +60843,7 @@ func (h *ASTElseifClauseList) ElseifClauses(i int32) (*ASTElseifClause, error) {
 func (h *ASTElseifClauseList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(173, 1, buf, wasm2go.Inv_173_1)
+		module().enqueueFree(173, 1, buf, wasm2go.Inv_173_1)
 		h.ptr = 0
 	}
 }
@@ -60786,7 +60887,7 @@ func (h *ASTEmptyRowPattern) SingleNodeDebugString() (string, error) {
 func (h *ASTEmptyRowPattern) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(174, 1, buf, wasm2go.Inv_174_1)
+		module().enqueueFree(174, 1, buf, wasm2go.Inv_174_1)
 		h.ptr = 0
 	}
 }
@@ -60823,7 +60924,7 @@ func (h *ASTExceptionHandler) StatementList() (*ASTStatementList, error) {
 func (h *ASTExceptionHandler) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(175, 1, buf, wasm2go.Inv_175_1)
+		module().enqueueFree(175, 1, buf, wasm2go.Inv_175_1)
 		h.ptr = 0
 	}
 }
@@ -60863,7 +60964,7 @@ func (h *ASTExceptionHandlerList) ExceptionHandlerList(i int32) (*ASTExceptionHa
 func (h *ASTExceptionHandlerList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(176, 1, buf, wasm2go.Inv_176_1)
+		module().enqueueFree(176, 1, buf, wasm2go.Inv_176_1)
 		h.ptr = 0
 	}
 }
@@ -60917,7 +61018,7 @@ func (h *ASTExecuteImmediateStatement) UsingClause() (*ASTExecuteUsingClause, er
 func (h *ASTExecuteImmediateStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(177, 3, buf, wasm2go.Inv_177_3)
+		module().enqueueFree(177, 3, buf, wasm2go.Inv_177_3)
 		h.ptr = 0
 	}
 }
@@ -60953,7 +61054,7 @@ func (h *ASTExecuteIntoClause) Identifiers() (*ASTIdentifierList, error) {
 func (h *ASTExecuteIntoClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(178, 1, buf, wasm2go.Inv_178_1)
+		module().enqueueFree(178, 1, buf, wasm2go.Inv_178_1)
 		h.ptr = 0
 	}
 }
@@ -60999,7 +61100,7 @@ func (h *ASTExecuteUsingArgument) Expression() (ASTExpressionNode, error) {
 func (h *ASTExecuteUsingArgument) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(179, 2, buf, wasm2go.Inv_179_2)
+		module().enqueueFree(179, 2, buf, wasm2go.Inv_179_2)
 		h.ptr = 0
 	}
 }
@@ -61036,7 +61137,7 @@ func (h *ASTExecuteUsingClause) Arguments(i int32) (*ASTExecuteUsingArgument, er
 func (h *ASTExecuteUsingClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(180, 1, buf, wasm2go.Inv_180_1)
+		module().enqueueFree(180, 1, buf, wasm2go.Inv_180_1)
 		h.ptr = 0
 	}
 }
@@ -61073,7 +61174,7 @@ func (h *ASTExplainStatement) Statement() (ASTStatementNode, error) {
 func (h *ASTExplainStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(181, 1, buf, wasm2go.Inv_181_1)
+		module().enqueueFree(181, 1, buf, wasm2go.Inv_181_1)
 		h.ptr = 0
 	}
 }
@@ -61131,7 +61232,7 @@ func (h *ASTExportDataStatement) WithConnectionClause() (*ASTWithConnectionClaus
 func (h *ASTExportDataStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(182, 3, buf, wasm2go.Inv_182_3)
+		module().enqueueFree(182, 3, buf, wasm2go.Inv_182_3)
 		h.ptr = 0
 	}
 }
@@ -61213,7 +61314,7 @@ func (h *ASTExportMetadataStatement) WithConnectionClause() (*ASTWithConnectionC
 func (h *ASTExportMetadataStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(183, 6, buf, wasm2go.Inv_183_6)
+		module().enqueueFree(183, 6, buf, wasm2go.Inv_183_6)
 		h.ptr = 0
 	}
 }
@@ -61267,7 +61368,7 @@ func (h *ASTExportModelStatement) WithConnectionClause() (*ASTWithConnectionClau
 func (h *ASTExportModelStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(184, 3, buf, wasm2go.Inv_184_3)
+		module().enqueueFree(184, 3, buf, wasm2go.Inv_184_3)
 		h.ptr = 0
 	}
 }
@@ -61333,7 +61434,7 @@ func (h *ASTExpression) SetParenthesized(parenthesized bool) error {
 func (h *ASTExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(185, 4, buf, wasm2go.Inv_185_4)
+		module().enqueueFree(185, 4, buf, wasm2go.Inv_185_4)
 		h.ptr = 0
 	}
 }
@@ -61417,7 +61518,7 @@ func (h *ASTExpressionSubquery) SetModifier(modifier ASTExpressionSubqueryEnums_
 func (h *ASTExpressionSubquery) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(186, 6, buf, wasm2go.Inv_186_6)
+		module().enqueueFree(186, 6, buf, wasm2go.Inv_186_6)
 		h.ptr = 0
 	}
 }
@@ -61462,7 +61563,7 @@ func (h *ASTExpressionWithAlias) Expression() (ASTExpressionNode, error) {
 func (h *ASTExpressionWithAlias) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(187, 2, buf, wasm2go.Inv_187_2)
+		module().enqueueFree(187, 2, buf, wasm2go.Inv_187_2)
 		h.ptr = 0
 	}
 }
@@ -61507,7 +61608,7 @@ func (h *ASTExpressionWithOptAlias) OptionalAlias() (*ASTAlias, error) {
 func (h *ASTExpressionWithOptAlias) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(188, 2, buf, wasm2go.Inv_188_2)
+		module().enqueueFree(188, 2, buf, wasm2go.Inv_188_2)
 		h.ptr = 0
 	}
 }
@@ -61552,7 +61653,7 @@ func (h *ASTExtendedPathExpression) ParenthesizedPath() (ASTGeneralizedPathExpre
 func (h *ASTExtendedPathExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(189, 2, buf, wasm2go.Inv_189_2)
+		module().enqueueFree(189, 2, buf, wasm2go.Inv_189_2)
 		h.ptr = 0
 	}
 }
@@ -61606,7 +61707,7 @@ func (h *ASTExtractExpression) TimeZoneExpr() (ASTExpressionNode, error) {
 func (h *ASTExtractExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(190, 3, buf, wasm2go.Inv_190_3)
+		module().enqueueFree(190, 3, buf, wasm2go.Inv_190_3)
 		h.ptr = 0
 	}
 }
@@ -61676,7 +61777,7 @@ func (h *ASTFilterFieldsArg) SetFilterType(filterType ASTFilterFieldsArgEnums_Fi
 func (h *ASTFilterFieldsArg) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(191, 5, buf, wasm2go.Inv_191_5)
+		module().enqueueFree(191, 5, buf, wasm2go.Inv_191_5)
 		h.ptr = 0
 	}
 }
@@ -61739,7 +61840,7 @@ func (h *ASTFilterUsingClause) SetHasFilterKeyword(hasFilterKeyword bool) error 
 func (h *ASTFilterUsingClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(192, 4, buf, wasm2go.Inv_192_4)
+		module().enqueueFree(192, 4, buf, wasm2go.Inv_192_4)
 		h.ptr = 0
 	}
 }
@@ -61778,7 +61879,7 @@ func (h *ASTFixedQuantifier) Bound() (ASTExpressionNode, error) {
 func (h *ASTFixedQuantifier) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(193, 1, buf, wasm2go.Inv_193_1)
+		module().enqueueFree(193, 1, buf, wasm2go.Inv_193_1)
 		h.ptr = 0
 	}
 }
@@ -61805,7 +61906,7 @@ func newASTFloatLiteralNoFinalizer(ptr uint64) *ASTFloatLiteral {
 func (h *ASTFloatLiteral) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(194, 0, buf, wasm2go.Inv_194_0)
+		module().enqueueFree(194, 0, buf, wasm2go.Inv_194_0)
 		h.ptr = 0
 	}
 }
@@ -61852,7 +61953,7 @@ func (h *ASTForInStatement) Variable() (*ASTIdentifier, error) {
 func (h *ASTForInStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(195, 2, buf, wasm2go.Inv_195_2)
+		module().enqueueFree(195, 2, buf, wasm2go.Inv_195_2)
 		h.ptr = 0
 	}
 }
@@ -61888,7 +61989,7 @@ func (h *ASTForSystemTime) Expression() (ASTExpressionNode, error) {
 func (h *ASTForSystemTime) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(196, 1, buf, wasm2go.Inv_196_1)
+		module().enqueueFree(196, 1, buf, wasm2go.Inv_196_1)
 		h.ptr = 0
 	}
 }
@@ -61951,7 +62052,7 @@ func (h *ASTForeignKey) Reference() (*ASTForeignKeyReference, error) {
 func (h *ASTForeignKey) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(197, 4, buf, wasm2go.Inv_197_4)
+		module().enqueueFree(197, 4, buf, wasm2go.Inv_197_4)
 		h.ptr = 0
 	}
 }
@@ -62019,7 +62120,7 @@ func (h *ASTForeignKeyActions) UpdateAction() (ASTForeignKeyActionsEnums_Action,
 func (h *ASTForeignKeyActions) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(198, 5, buf, wasm2go.Inv_198_5)
+		module().enqueueFree(198, 5, buf, wasm2go.Inv_198_5)
 		h.ptr = 0
 	}
 }
@@ -62073,7 +62174,7 @@ func (h *ASTForeignKeyColumnAttribute) Reference() (*ASTForeignKeyReference, err
 func (h *ASTForeignKeyColumnAttribute) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(199, 3, buf, wasm2go.Inv_199_3)
+		module().enqueueFree(199, 3, buf, wasm2go.Inv_199_3)
 		h.ptr = 0
 	}
 }
@@ -62177,7 +62278,7 @@ func (h *ASTForeignKeyReference) TableName() (*ASTPathExpression, error) {
 func (h *ASTForeignKeyReference) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(200, 9, buf, wasm2go.Inv_200_9)
+		module().enqueueFree(200, 9, buf, wasm2go.Inv_200_9)
 		h.ptr = 0
 	}
 }
@@ -62222,7 +62323,7 @@ func (h *ASTFormatClause) TimeZoneExpr() (ASTExpressionNode, error) {
 func (h *ASTFormatClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(201, 2, buf, wasm2go.Inv_201_2)
+		module().enqueueFree(201, 2, buf, wasm2go.Inv_201_2)
 		h.ptr = 0
 	}
 }
@@ -62261,7 +62362,7 @@ func (h *ASTFromClause) TableExpression() (ASTTableExpressionNode, error) {
 func (h *ASTFromClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(202, 1, buf, wasm2go.Inv_202_1)
+		module().enqueueFree(202, 1, buf, wasm2go.Inv_202_1)
 		h.ptr = 0
 	}
 }
@@ -62299,7 +62400,7 @@ func (h *ASTFromQuery) FromClause() (*ASTFromClause, error) {
 func (h *ASTFromQuery) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(203, 1, buf, wasm2go.Inv_203_1)
+		module().enqueueFree(203, 1, buf, wasm2go.Inv_203_1)
 		h.ptr = 0
 	}
 }
@@ -62552,7 +62653,7 @@ func (h *ASTFunctionCall) WithReportModifier() (*ASTWithReportModifier, error) {
 func (h *ASTFunctionCall) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(204, 22, buf, wasm2go.Inv_204_22)
+		module().enqueueFree(204, 22, buf, wasm2go.Inv_204_22)
 		h.ptr = 0
 	}
 }
@@ -62609,7 +62710,7 @@ func (h *ASTFunctionDeclaration) Parameters() (*ASTFunctionParameters, error) {
 func (h *ASTFunctionDeclaration) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(205, 3, buf, wasm2go.Inv_205_3)
+		module().enqueueFree(205, 3, buf, wasm2go.Inv_205_3)
 		h.ptr = 0
 	}
 }
@@ -62749,7 +62850,7 @@ func (h *ASTFunctionParameter) Type() (ASTTypeNode, error) {
 func (h *ASTFunctionParameter) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(206, 13, buf, wasm2go.Inv_206_13)
+		module().enqueueFree(206, 13, buf, wasm2go.Inv_206_13)
 		h.ptr = 0
 	}
 }
@@ -62786,7 +62887,7 @@ func (h *ASTFunctionParameters) ParameterEntries(i int32) (*ASTFunctionParameter
 func (h *ASTFunctionParameters) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(207, 1, buf, wasm2go.Inv_207_1)
+		module().enqueueFree(207, 1, buf, wasm2go.Inv_207_1)
 		h.ptr = 0
 	}
 }
@@ -62849,7 +62950,7 @@ func (h *ASTFunctionType) TypeParameters() (*ASTTypeParameterList, error) {
 func (h *ASTFunctionType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(208, 4, buf, wasm2go.Inv_208_4)
+		module().enqueueFree(208, 4, buf, wasm2go.Inv_208_4)
 		h.ptr = 0
 	}
 }
@@ -62886,7 +62987,7 @@ func (h *ASTFunctionTypeArgList) Args(i int32) (ASTTypeNode, error) {
 func (h *ASTFunctionTypeArgList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(209, 1, buf, wasm2go.Inv_209_1)
+		module().enqueueFree(209, 1, buf, wasm2go.Inv_209_1)
 		h.ptr = 0
 	}
 }
@@ -62948,7 +63049,7 @@ func newASTGeneralizedPathExpressionNoFinalizer(ptr uint64) *ASTGeneralizedPathE
 func (h *ASTGeneralizedPathExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(210, 0, buf, wasm2go.Inv_210_0)
+		module().enqueueFree(210, 0, buf, wasm2go.Inv_210_0)
 		h.ptr = 0
 	}
 }
@@ -63053,7 +63154,7 @@ func (h *ASTGeneratedColumnInfo) StoredMode() (ASTGeneratedColumnInfoEnums_Store
 func (h *ASTGeneratedColumnInfo) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(211, 9, buf, wasm2go.Inv_211_9)
+		module().enqueueFree(211, 9, buf, wasm2go.Inv_211_9)
 		h.ptr = 0
 	}
 }
@@ -63145,7 +63246,7 @@ func (h *ASTGqlCallBase) SetOptional(optional bool) error {
 func (h *ASTGqlCallBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(212, 5, buf, wasm2go.Inv_212_5)
+		module().enqueueFree(212, 5, buf, wasm2go.Inv_212_5)
 		h.ptr = 0
 	}
 }
@@ -63182,7 +63283,7 @@ func (h *ASTGqlFilter) Condition() (*ASTWhereClause, error) {
 func (h *ASTGqlFilter) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(213, 1, buf, wasm2go.Inv_213_1)
+		module().enqueueFree(213, 1, buf, wasm2go.Inv_213_1)
 		h.ptr = 0
 	}
 }
@@ -63237,7 +63338,7 @@ func (h *ASTGqlFor) WithOffset() (*ASTWithOffset, error) {
 func (h *ASTGqlFor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(214, 3, buf, wasm2go.Inv_214_3)
+		module().enqueueFree(214, 3, buf, wasm2go.Inv_214_3)
 		h.ptr = 0
 	}
 }
@@ -63286,7 +63387,7 @@ func (h *ASTGqlGraphPatternQuery) GraphReference() (*ASTPathExpression, error) {
 func (h *ASTGqlGraphPatternQuery) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(215, 2, buf, wasm2go.Inv_215_2)
+		module().enqueueFree(215, 2, buf, wasm2go.Inv_215_2)
 		h.ptr = 0
 	}
 }
@@ -63323,7 +63424,7 @@ func (h *ASTGqlInlineSubqueryCall) Subquery() (*ASTQuery, error) {
 func (h *ASTGqlInlineSubqueryCall) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(216, 1, buf, wasm2go.Inv_216_1)
+		module().enqueueFree(216, 1, buf, wasm2go.Inv_216_1)
 		h.ptr = 0
 	}
 }
@@ -63360,7 +63461,7 @@ func (h *ASTGqlLet) VariableDefinitionList() (*ASTGqlLetVariableDefinitionList, 
 func (h *ASTGqlLet) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(217, 1, buf, wasm2go.Inv_217_1)
+		module().enqueueFree(217, 1, buf, wasm2go.Inv_217_1)
 		h.ptr = 0
 	}
 }
@@ -63406,7 +63507,7 @@ func (h *ASTGqlLetVariableDefinition) Identifier() (*ASTIdentifier, error) {
 func (h *ASTGqlLetVariableDefinition) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(218, 2, buf, wasm2go.Inv_218_2)
+		module().enqueueFree(218, 2, buf, wasm2go.Inv_218_2)
 		h.ptr = 0
 	}
 }
@@ -63444,7 +63545,7 @@ func (h *ASTGqlLetVariableDefinitionList) VariableDefinitions(i int32) (*ASTGqlL
 func (h *ASTGqlLetVariableDefinitionList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(219, 1, buf, wasm2go.Inv_219_1)
+		module().enqueueFree(219, 1, buf, wasm2go.Inv_219_1)
 		h.ptr = 0
 	}
 }
@@ -63493,7 +63594,7 @@ func (h *ASTGqlLinearOpsQuery) LinearOps() (*ASTGqlOperatorList, error) {
 func (h *ASTGqlLinearOpsQuery) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(220, 2, buf, wasm2go.Inv_220_2)
+		module().enqueueFree(220, 2, buf, wasm2go.Inv_220_2)
 		h.ptr = 0
 	}
 }
@@ -63567,7 +63668,7 @@ func (h *ASTGqlMatch) SetOptional(optional bool) error {
 func (h *ASTGqlMatch) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(221, 5, buf, wasm2go.Inv_221_5)
+		module().enqueueFree(221, 5, buf, wasm2go.Inv_221_5)
 		h.ptr = 0
 	}
 }
@@ -63614,7 +63715,7 @@ func (h *ASTGqlNamedCall) YieldClause() (*ASTYieldItemList, error) {
 func (h *ASTGqlNamedCall) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(222, 2, buf, wasm2go.Inv_222_2)
+		module().enqueueFree(222, 2, buf, wasm2go.Inv_222_2)
 		h.ptr = 0
 	}
 }
@@ -63644,7 +63745,7 @@ func newASTGqlOperatorNoFinalizer(ptr uint64) *ASTGqlOperator {
 func (h *ASTGqlOperator) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(223, 0, buf, wasm2go.Inv_223_0)
+		module().enqueueFree(223, 0, buf, wasm2go.Inv_223_0)
 		h.ptr = 0
 	}
 }
@@ -63674,7 +63775,7 @@ func newASTGqlOperatorListNoFinalizer(ptr uint64) *ASTGqlOperatorList {
 func (h *ASTGqlOperatorList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(224, 0, buf, wasm2go.Inv_224_0)
+		module().enqueueFree(224, 0, buf, wasm2go.Inv_224_0)
 		h.ptr = 0
 	}
 }
@@ -63727,7 +63828,7 @@ func (h *ASTGqlOrderByAndPage) Page() (*ASTGqlPage, error) {
 func (h *ASTGqlOrderByAndPage) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(225, 2, buf, wasm2go.Inv_225_2)
+		module().enqueueFree(225, 2, buf, wasm2go.Inv_225_2)
 		h.ptr = 0
 	}
 }
@@ -63780,7 +63881,7 @@ func (h *ASTGqlPage) Offset() (*ASTGqlPageOffset, error) {
 func (h *ASTGqlPage) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(226, 2, buf, wasm2go.Inv_226_2)
+		module().enqueueFree(226, 2, buf, wasm2go.Inv_226_2)
 		h.ptr = 0
 	}
 }
@@ -63827,7 +63928,7 @@ func (h *ASTGqlPageLimit) Limit() (ASTExpressionNode, error) {
 func (h *ASTGqlPageLimit) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(227, 1, buf, wasm2go.Inv_227_1)
+		module().enqueueFree(227, 1, buf, wasm2go.Inv_227_1)
 		h.ptr = 0
 	}
 }
@@ -63874,7 +63975,7 @@ func (h *ASTGqlPageOffset) Offset() (ASTExpressionNode, error) {
 func (h *ASTGqlPageOffset) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(228, 1, buf, wasm2go.Inv_228_1)
+		module().enqueueFree(228, 1, buf, wasm2go.Inv_228_1)
 		h.ptr = 0
 	}
 }
@@ -63915,7 +64016,7 @@ func (h *ASTGqlQuery) GraphTable() (*ASTGraphTableQuery, error) {
 func (h *ASTGqlQuery) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(229, 1, buf, wasm2go.Inv_229_1)
+		module().enqueueFree(229, 1, buf, wasm2go.Inv_229_1)
 		h.ptr = 0
 	}
 }
@@ -63965,7 +64066,7 @@ func (h *ASTGqlReturn) Select() (*ASTSelect, error) {
 func (h *ASTGqlReturn) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(230, 2, buf, wasm2go.Inv_230_2)
+		module().enqueueFree(230, 2, buf, wasm2go.Inv_230_2)
 		h.ptr = 0
 	}
 }
@@ -64002,7 +64103,7 @@ func (h *ASTGqlSample) Sample() (*ASTSampleClause, error) {
 func (h *ASTGqlSample) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(231, 1, buf, wasm2go.Inv_231_1)
+		module().enqueueFree(231, 1, buf, wasm2go.Inv_231_1)
 		h.ptr = 0
 	}
 }
@@ -64050,7 +64151,7 @@ func (h *ASTGqlSetOperation) Metadata() (*ASTSetOperationMetadataList, error) {
 func (h *ASTGqlSetOperation) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(232, 2, buf, wasm2go.Inv_232_2)
+		module().enqueueFree(232, 2, buf, wasm2go.Inv_232_2)
 		h.ptr = 0
 	}
 }
@@ -64089,7 +64190,7 @@ func (h *ASTGqlWith) Select() (*ASTSelect, error) {
 func (h *ASTGqlWith) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(233, 1, buf, wasm2go.Inv_233_1)
+		module().enqueueFree(233, 1, buf, wasm2go.Inv_233_1)
 		h.ptr = 0
 	}
 }
@@ -64162,7 +64263,7 @@ func (h *ASTGrantStatement) TargetTypeParts(i int32) (*ASTIdentifier, error) {
 func (h *ASTGrantStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(234, 5, buf, wasm2go.Inv_234_5)
+		module().enqueueFree(234, 5, buf, wasm2go.Inv_234_5)
 		h.ptr = 0
 	}
 }
@@ -64227,7 +64328,7 @@ func (h *ASTGrantToClause) SetHasGrantKeywordAndParens(hasGrantKeywordAndParens 
 func (h *ASTGrantToClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(235, 4, buf, wasm2go.Inv_235_4)
+		module().enqueueFree(235, 4, buf, wasm2go.Inv_235_4)
 		h.ptr = 0
 	}
 }
@@ -64264,7 +64365,7 @@ func (h *ASTGranteeList) GranteeList(i int32) (ASTExpressionNode, error) {
 func (h *ASTGranteeList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(236, 1, buf, wasm2go.Inv_236_1)
+		module().enqueueFree(236, 1, buf, wasm2go.Inv_236_1)
 		h.ptr = 0
 	}
 }
@@ -64327,7 +64428,7 @@ func (h *ASTGraphDerivedProperty) OptionsList() (*ASTOptionsList, error) {
 func (h *ASTGraphDerivedProperty) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(237, 3, buf, wasm2go.Inv_237_3)
+		module().enqueueFree(237, 3, buf, wasm2go.Inv_237_3)
 		h.ptr = 0
 	}
 }
@@ -64364,7 +64465,7 @@ func (h *ASTGraphDerivedPropertyList) Properties(i int32) (*ASTGraphDerivedPrope
 func (h *ASTGraphDerivedPropertyList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(238, 1, buf, wasm2go.Inv_238_1)
+		module().enqueueFree(238, 1, buf, wasm2go.Inv_238_1)
 		h.ptr = 0
 	}
 }
@@ -64401,7 +64502,7 @@ func (h *ASTGraphDynamicLabel) Label() (ASTExpressionNode, error) {
 func (h *ASTGraphDynamicLabel) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(239, 1, buf, wasm2go.Inv_239_1)
+		module().enqueueFree(239, 1, buf, wasm2go.Inv_239_1)
 		h.ptr = 0
 	}
 }
@@ -64438,7 +64539,7 @@ func (h *ASTGraphDynamicProperties) Properties() (ASTExpressionNode, error) {
 func (h *ASTGraphDynamicProperties) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(240, 1, buf, wasm2go.Inv_240_1)
+		module().enqueueFree(240, 1, buf, wasm2go.Inv_240_1)
 		h.ptr = 0
 	}
 }
@@ -64500,7 +64601,7 @@ func (h *ASTGraphEdgePattern) SetOrientation(orientation ASTGraphEdgePatternEnum
 func (h *ASTGraphEdgePattern) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(241, 4, buf, wasm2go.Inv_241_4)
+		module().enqueueFree(241, 4, buf, wasm2go.Inv_241_4)
 		h.ptr = 0
 	}
 }
@@ -64536,7 +64637,7 @@ func (h *ASTGraphElementLabel) Name() (*ASTIdentifier, error) {
 func (h *ASTGraphElementLabel) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(242, 1, buf, wasm2go.Inv_242_1)
+		module().enqueueFree(242, 1, buf, wasm2go.Inv_242_1)
 		h.ptr = 0
 	}
 }
@@ -64595,7 +64696,7 @@ func (h *ASTGraphElementLabelAndProperties) Properties() (*ASTGraphProperties, e
 func (h *ASTGraphElementLabelAndProperties) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(243, 3, buf, wasm2go.Inv_243_3)
+		module().enqueueFree(243, 3, buf, wasm2go.Inv_243_3)
 		h.ptr = 0
 	}
 }
@@ -64632,7 +64733,7 @@ func (h *ASTGraphElementLabelAndPropertiesList) LabelPropertiesList(i int32) (*A
 func (h *ASTGraphElementLabelAndPropertiesList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(244, 1, buf, wasm2go.Inv_244_1)
+		module().enqueueFree(244, 1, buf, wasm2go.Inv_244_1)
 		h.ptr = 0
 	}
 }
@@ -64671,7 +64772,7 @@ func (h *ASTGraphElementPattern) Filler() (*ASTGraphElementPatternFiller, error)
 func (h *ASTGraphElementPattern) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(245, 1, buf, wasm2go.Inv_245_1)
+		module().enqueueFree(245, 1, buf, wasm2go.Inv_245_1)
 		h.ptr = 0
 	}
 }
@@ -64755,7 +64856,7 @@ func (h *ASTGraphElementPatternFiller) WhereClause() (*ASTWhereClause, error) {
 func (h *ASTGraphElementPatternFiller) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(246, 6, buf, wasm2go.Inv_246_6)
+		module().enqueueFree(246, 6, buf, wasm2go.Inv_246_6)
 		h.ptr = 0
 	}
 }
@@ -64877,7 +64978,7 @@ func (h *ASTGraphElementTable) SourceNodeReference() (*ASTGraphNodeTableReferenc
 func (h *ASTGraphElementTable) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(247, 9, buf, wasm2go.Inv_247_9)
+		module().enqueueFree(247, 9, buf, wasm2go.Inv_247_9)
 		h.ptr = 0
 	}
 }
@@ -64914,7 +65015,7 @@ func (h *ASTGraphElementTableList) ElementTables(i int32) (*ASTGraphElementTable
 func (h *ASTGraphElementTableList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(248, 1, buf, wasm2go.Inv_248_1)
+		module().enqueueFree(248, 1, buf, wasm2go.Inv_248_1)
 		h.ptr = 0
 	}
 }
@@ -64981,7 +65082,7 @@ func (h *ASTGraphIsLabeledPredicate) SetIsNot(isNot bool) error {
 func (h *ASTGraphIsLabeledPredicate) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(249, 4, buf, wasm2go.Inv_249_4)
+		module().enqueueFree(249, 4, buf, wasm2go.Inv_249_4)
 		h.ptr = 0
 	}
 }
@@ -65027,7 +65128,7 @@ func (h *ASTGraphLabelExpression) SetParenthesized(parenthesized bool) error {
 func (h *ASTGraphLabelExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(250, 2, buf, wasm2go.Inv_250_2)
+		module().enqueueFree(250, 2, buf, wasm2go.Inv_250_2)
 		h.ptr = 0
 	}
 }
@@ -65066,7 +65167,7 @@ func (h *ASTGraphLabelFilter) LabelExpression() (ASTGraphLabelExpressionNode, er
 func (h *ASTGraphLabelFilter) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(251, 1, buf, wasm2go.Inv_251_1)
+		module().enqueueFree(251, 1, buf, wasm2go.Inv_251_1)
 		h.ptr = 0
 	}
 }
@@ -65128,7 +65229,7 @@ func (h *ASTGraphLabelOperation) SetOpType(opType ASTGraphLabelOperationEnums_Op
 func (h *ASTGraphLabelOperation) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(252, 4, buf, wasm2go.Inv_252_4)
+		module().enqueueFree(252, 4, buf, wasm2go.Inv_252_4)
 		h.ptr = 0
 	}
 }
@@ -65166,7 +65267,7 @@ func (h *ASTGraphLhsHint) Hint() (*ASTHint, error) {
 func (h *ASTGraphLhsHint) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(253, 1, buf, wasm2go.Inv_253_1)
+		module().enqueueFree(253, 1, buf, wasm2go.Inv_253_1)
 		h.ptr = 0
 	}
 }
@@ -65194,7 +65295,7 @@ func newASTGraphNodePatternNoFinalizer(ptr uint64) *ASTGraphNodePattern {
 func (h *ASTGraphNodePattern) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(254, 0, buf, wasm2go.Inv_254_0)
+		module().enqueueFree(254, 0, buf, wasm2go.Inv_254_0)
 		h.ptr = 0
 	}
 }
@@ -65276,7 +65377,7 @@ func (h *ASTGraphNodeTableReference) SetNodeReferenceType(nodeReferenceType ASTG
 func (h *ASTGraphNodeTableReference) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(255, 6, buf, wasm2go.Inv_255_6)
+		module().enqueueFree(255, 6, buf, wasm2go.Inv_255_6)
 		h.ptr = 0
 	}
 }
@@ -65316,7 +65417,7 @@ func (h *ASTGraphPathBase) Quantifier() (ASTQuantifierNode, error) {
 func (h *ASTGraphPathBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(256, 1, buf, wasm2go.Inv_256_1)
+		module().enqueueFree(256, 1, buf, wasm2go.Inv_256_1)
 		h.ptr = 0
 	}
 }
@@ -65360,7 +65461,7 @@ func (h *ASTGraphPathMode) SetPathMode(pathMode ASTGraphPathModeEnums_PathMode) 
 func (h *ASTGraphPathMode) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(257, 2, buf, wasm2go.Inv_257_2)
+		module().enqueueFree(257, 2, buf, wasm2go.Inv_257_2)
 		h.ptr = 0
 	}
 }
@@ -65470,7 +65571,7 @@ func (h *ASTGraphPathPattern) WhereClause() (*ASTWhereClause, error) {
 func (h *ASTGraphPathPattern) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(258, 9, buf, wasm2go.Inv_258_9)
+		module().enqueueFree(258, 9, buf, wasm2go.Inv_258_9)
 		h.ptr = 0
 	}
 }
@@ -65528,7 +65629,7 @@ func (h *ASTGraphPathSearchPrefix) Type() (ASTGraphPathSearchPrefixEnums_PathSea
 func (h *ASTGraphPathSearchPrefix) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(259, 3, buf, wasm2go.Inv_259_3)
+		module().enqueueFree(259, 3, buf, wasm2go.Inv_259_3)
 		h.ptr = 0
 	}
 }
@@ -65566,7 +65667,7 @@ func (h *ASTGraphPathSearchPrefixCount) PathCount() (ASTExpressionNode, error) {
 func (h *ASTGraphPathSearchPrefixCount) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(260, 1, buf, wasm2go.Inv_260_1)
+		module().enqueueFree(260, 1, buf, wasm2go.Inv_260_1)
 		h.ptr = 0
 	}
 }
@@ -65615,7 +65716,7 @@ func (h *ASTGraphPattern) WhereClause() (*ASTWhereClause, error) {
 func (h *ASTGraphPattern) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(261, 2, buf, wasm2go.Inv_261_2)
+		module().enqueueFree(261, 2, buf, wasm2go.Inv_261_2)
 		h.ptr = 0
 	}
 }
@@ -65689,7 +65790,7 @@ func (h *ASTGraphProperties) SetNoProperties(noProperties bool) error {
 func (h *ASTGraphProperties) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(262, 4, buf, wasm2go.Inv_262_4)
+		module().enqueueFree(262, 4, buf, wasm2go.Inv_262_4)
 		h.ptr = 0
 	}
 }
@@ -65735,7 +65836,7 @@ func (h *ASTGraphPropertyNameAndValue) Value() (ASTExpressionNode, error) {
 func (h *ASTGraphPropertyNameAndValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(263, 2, buf, wasm2go.Inv_263_2)
+		module().enqueueFree(263, 2, buf, wasm2go.Inv_263_2)
 		h.ptr = 0
 	}
 }
@@ -65774,7 +65875,7 @@ func (h *ASTGraphPropertySpecification) PropertyNameAndValue(i int32) (*ASTGraph
 func (h *ASTGraphPropertySpecification) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(264, 1, buf, wasm2go.Inv_264_1)
+		module().enqueueFree(264, 1, buf, wasm2go.Inv_264_1)
 		h.ptr = 0
 	}
 }
@@ -65812,7 +65913,7 @@ func (h *ASTGraphRhsHint) Hint() (*ASTHint, error) {
 func (h *ASTGraphRhsHint) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(265, 1, buf, wasm2go.Inv_265_1)
+		module().enqueueFree(265, 1, buf, wasm2go.Inv_265_1)
 		h.ptr = 0
 	}
 }
@@ -65884,7 +65985,7 @@ func (h *ASTGraphTableQuery) GraphTableShape() (*ASTSelectList, error) {
 func (h *ASTGraphTableQuery) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(266, 4, buf, wasm2go.Inv_266_4)
+		module().enqueueFree(266, 4, buf, wasm2go.Inv_266_4)
 		h.ptr = 0
 	}
 }
@@ -65911,7 +66012,7 @@ func newASTGraphWildcardLabelNoFinalizer(ptr uint64) *ASTGraphWildcardLabel {
 func (h *ASTGraphWildcardLabel) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(267, 0, buf, wasm2go.Inv_267_0)
+		module().enqueueFree(267, 0, buf, wasm2go.Inv_267_0)
 		h.ptr = 0
 	}
 }
@@ -65995,7 +66096,7 @@ func (h *ASTGroupBy) SetAndOrderBy(andOrderBy bool) error {
 func (h *ASTGroupBy) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(268, 6, buf, wasm2go.Inv_268_6)
+		module().enqueueFree(268, 6, buf, wasm2go.Inv_268_6)
 		h.ptr = 0
 	}
 }
@@ -66024,7 +66125,7 @@ func newASTGroupByAllNoFinalizer(ptr uint64) *ASTGroupByAll {
 func (h *ASTGroupByAll) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(269, 0, buf, wasm2go.Inv_269_0)
+		module().enqueueFree(269, 0, buf, wasm2go.Inv_269_0)
 		h.ptr = 0
 	}
 }
@@ -66117,7 +66218,7 @@ func (h *ASTGroupingItem) Rollup() (*ASTRollup, error) {
 func (h *ASTGroupingItem) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(270, 6, buf, wasm2go.Inv_270_6)
+		module().enqueueFree(270, 6, buf, wasm2go.Inv_270_6)
 		h.ptr = 0
 	}
 }
@@ -66187,7 +66288,7 @@ func (h *ASTGroupingItemOrder) SetOrderingSpec(orderingSpec ASTOrderingExpressio
 func (h *ASTGroupingItemOrder) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(271, 5, buf, wasm2go.Inv_271_5)
+		module().enqueueFree(271, 5, buf, wasm2go.Inv_271_5)
 		h.ptr = 0
 	}
 }
@@ -66247,7 +66348,7 @@ func (h *ASTGroupingSet) Rollup() (*ASTRollup, error) {
 func (h *ASTGroupingSet) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(272, 3, buf, wasm2go.Inv_272_3)
+		module().enqueueFree(272, 3, buf, wasm2go.Inv_272_3)
 		h.ptr = 0
 	}
 }
@@ -66285,7 +66386,7 @@ func (h *ASTGroupingSetList) GroupingSets(i int32) (*ASTGroupingSet, error) {
 func (h *ASTGroupingSetList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(273, 1, buf, wasm2go.Inv_273_1)
+		module().enqueueFree(273, 1, buf, wasm2go.Inv_273_1)
 		h.ptr = 0
 	}
 }
@@ -66321,7 +66422,7 @@ func (h *ASTHaving) Expression() (ASTExpressionNode, error) {
 func (h *ASTHaving) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(274, 1, buf, wasm2go.Inv_274_1)
+		module().enqueueFree(274, 1, buf, wasm2go.Inv_274_1)
 		h.ptr = 0
 	}
 }
@@ -66373,7 +66474,7 @@ func (h *ASTHavingModifier) SetModifierKind(modifierKind ASTHavingModifierEnums_
 func (h *ASTHavingModifier) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(275, 3, buf, wasm2go.Inv_275_3)
+		module().enqueueFree(275, 3, buf, wasm2go.Inv_275_3)
 		h.ptr = 0
 	}
 }
@@ -66409,7 +66510,7 @@ func (h *ASTHiddenColumnAttribute) SingleNodeSqlString() (string, error) {
 func (h *ASTHiddenColumnAttribute) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(276, 1, buf, wasm2go.Inv_276_1)
+		module().enqueueFree(276, 1, buf, wasm2go.Inv_276_1)
 		h.ptr = 0
 	}
 }
@@ -66461,7 +66562,7 @@ func (h *ASTHint) NumShardsHint() (*ASTIntLiteral, error) {
 func (h *ASTHint) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(277, 2, buf, wasm2go.Inv_277_2)
+		module().enqueueFree(277, 2, buf, wasm2go.Inv_277_2)
 		h.ptr = 0
 	}
 }
@@ -66517,7 +66618,7 @@ func (h *ASTHintEntry) Value() (ASTExpressionNode, error) {
 func (h *ASTHintEntry) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(278, 3, buf, wasm2go.Inv_278_3)
+		module().enqueueFree(278, 3, buf, wasm2go.Inv_278_3)
 		h.ptr = 0
 	}
 }
@@ -66563,7 +66664,7 @@ func (h *ASTHintedStatement) Statement() (ASTStatementNode, error) {
 func (h *ASTHintedStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(279, 2, buf, wasm2go.Inv_279_2)
+		module().enqueueFree(279, 2, buf, wasm2go.Inv_279_2)
 		h.ptr = 0
 	}
 }
@@ -66660,7 +66761,7 @@ func (h *ASTIdentifier) SetIsQuoted(isQuoted bool) error {
 func (h *ASTIdentifier) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(280, 7, buf, wasm2go.Inv_280_7)
+		module().enqueueFree(280, 7, buf, wasm2go.Inv_280_7)
 		h.ptr = 0
 	}
 }
@@ -66697,7 +66798,7 @@ func (h *ASTIdentifierList) IdentifierList(i int32) (*ASTIdentifier, error) {
 func (h *ASTIdentifierList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(281, 1, buf, wasm2go.Inv_281_1)
+		module().enqueueFree(281, 1, buf, wasm2go.Inv_281_1)
 		h.ptr = 0
 	}
 }
@@ -66733,7 +66834,7 @@ func (h *ASTIdentityColumnIncrementBy) Value() (ASTExpressionNode, error) {
 func (h *ASTIdentityColumnIncrementBy) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(282, 1, buf, wasm2go.Inv_282_1)
+		module().enqueueFree(282, 1, buf, wasm2go.Inv_282_1)
 		h.ptr = 0
 	}
 }
@@ -66812,7 +66913,7 @@ func (h *ASTIdentityColumnInfo) StartWithValue() (*ASTIdentityColumnStartWith, e
 func (h *ASTIdentityColumnInfo) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(283, 6, buf, wasm2go.Inv_283_6)
+		module().enqueueFree(283, 6, buf, wasm2go.Inv_283_6)
 		h.ptr = 0
 	}
 }
@@ -66848,7 +66949,7 @@ func (h *ASTIdentityColumnMaxValue) Value() (ASTExpressionNode, error) {
 func (h *ASTIdentityColumnMaxValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(284, 1, buf, wasm2go.Inv_284_1)
+		module().enqueueFree(284, 1, buf, wasm2go.Inv_284_1)
 		h.ptr = 0
 	}
 }
@@ -66884,7 +66985,7 @@ func (h *ASTIdentityColumnMinValue) Value() (ASTExpressionNode, error) {
 func (h *ASTIdentityColumnMinValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(285, 1, buf, wasm2go.Inv_285_1)
+		module().enqueueFree(285, 1, buf, wasm2go.Inv_285_1)
 		h.ptr = 0
 	}
 }
@@ -66920,7 +67021,7 @@ func (h *ASTIdentityColumnStartWith) Value() (ASTExpressionNode, error) {
 func (h *ASTIdentityColumnStartWith) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(286, 1, buf, wasm2go.Inv_286_1)
+		module().enqueueFree(286, 1, buf, wasm2go.Inv_286_1)
 		h.ptr = 0
 	}
 }
@@ -66987,7 +67088,7 @@ func (h *ASTIfStatement) ThenList() (*ASTStatementList, error) {
 func (h *ASTIfStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(287, 4, buf, wasm2go.Inv_287_4)
+		module().enqueueFree(287, 4, buf, wasm2go.Inv_287_4)
 		h.ptr = 0
 	}
 }
@@ -67077,7 +67178,7 @@ func (h *ASTImportStatement) StringValue() (*ASTStringLiteral, error) {
 func (h *ASTImportStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(288, 7, buf, wasm2go.Inv_288_7)
+		module().enqueueFree(288, 7, buf, wasm2go.Inv_288_7)
 		h.ptr = 0
 	}
 }
@@ -67198,7 +67299,7 @@ func (h *ASTInExpression) UnnestExpr() (*ASTUnnestExpression, error) {
 func (h *ASTInExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(289, 10, buf, wasm2go.Inv_289_10)
+		module().enqueueFree(289, 10, buf, wasm2go.Inv_289_10)
 		h.ptr = 0
 	}
 }
@@ -67236,7 +67337,7 @@ func (h *ASTInList) List(i int32) (ASTExpressionNode, error) {
 func (h *ASTInList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(290, 1, buf, wasm2go.Inv_290_1)
+		module().enqueueFree(290, 1, buf, wasm2go.Inv_290_1)
 		h.ptr = 0
 	}
 }
@@ -67273,7 +67374,7 @@ func (h *ASTIndexAllColumns) ColumnOptions() (*ASTIndexItemList, error) {
 func (h *ASTIndexAllColumns) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(291, 1, buf, wasm2go.Inv_291_1)
+		module().enqueueFree(291, 1, buf, wasm2go.Inv_291_1)
 		h.ptr = 0
 	}
 }
@@ -67311,7 +67412,7 @@ func (h *ASTIndexItemList) OrderingExpressions(i int32) (*ASTOrderingExpression,
 func (h *ASTIndexItemList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(292, 1, buf, wasm2go.Inv_292_1)
+		module().enqueueFree(292, 1, buf, wasm2go.Inv_292_1)
 		h.ptr = 0
 	}
 }
@@ -67350,7 +67451,7 @@ func (h *ASTIndexStoringExpressionList) Expressions(i int32) (ASTExpressionNode,
 func (h *ASTIndexStoringExpressionList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(293, 1, buf, wasm2go.Inv_293_1)
+		module().enqueueFree(293, 1, buf, wasm2go.Inv_293_1)
 		h.ptr = 0
 	}
 }
@@ -67388,7 +67489,7 @@ func (h *ASTIndexUnnestExpressionList) UnnestExpressions(i int32) (*ASTUnnestExp
 func (h *ASTIndexUnnestExpressionList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(294, 1, buf, wasm2go.Inv_294_1)
+		module().enqueueFree(294, 1, buf, wasm2go.Inv_294_1)
 		h.ptr = 0
 	}
 }
@@ -67415,7 +67516,7 @@ func newASTInferredTypeColumnSchemaNoFinalizer(ptr uint64) *ASTInferredTypeColum
 func (h *ASTInferredTypeColumnSchema) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(295, 0, buf, wasm2go.Inv_295_0)
+		module().enqueueFree(295, 0, buf, wasm2go.Inv_295_0)
 		h.ptr = 0
 	}
 }
@@ -67460,7 +67561,7 @@ func (h *ASTInputOutputClause) Output() (*ASTTableElementList, error) {
 func (h *ASTInputOutputClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(296, 2, buf, wasm2go.Inv_296_2)
+		module().enqueueFree(296, 2, buf, wasm2go.Inv_296_2)
 		h.ptr = 0
 	}
 }
@@ -67488,7 +67589,7 @@ func newASTInputTableArgumentNoFinalizer(ptr uint64) *ASTInputTableArgument {
 func (h *ASTInputTableArgument) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(297, 0, buf, wasm2go.Inv_297_0)
+		module().enqueueFree(297, 0, buf, wasm2go.Inv_297_0)
 		h.ptr = 0
 	}
 }
@@ -67664,7 +67765,7 @@ func (h *ASTInsertStatement) TargetPath() (ASTGeneralizedPathExpressionNode, err
 func (h *ASTInsertStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(298, 16, buf, wasm2go.Inv_298_16)
+		module().enqueueFree(298, 16, buf, wasm2go.Inv_298_16)
 		h.ptr = 0
 	}
 }
@@ -67701,7 +67802,7 @@ func (h *ASTInsertValuesRow) Values(i int32) (ASTExpressionNode, error) {
 func (h *ASTInsertValuesRow) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(299, 1, buf, wasm2go.Inv_299_1)
+		module().enqueueFree(299, 1, buf, wasm2go.Inv_299_1)
 		h.ptr = 0
 	}
 }
@@ -67738,7 +67839,7 @@ func (h *ASTInsertValuesRowList) Rows(i int32) (*ASTInsertValuesRow, error) {
 func (h *ASTInsertValuesRowList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(300, 1, buf, wasm2go.Inv_300_1)
+		module().enqueueFree(300, 1, buf, wasm2go.Inv_300_1)
 		h.ptr = 0
 	}
 }
@@ -67774,7 +67875,7 @@ func (h *ASTIntLiteral) IsHex() (bool, error) {
 func (h *ASTIntLiteral) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(301, 1, buf, wasm2go.Inv_301_1)
+		module().enqueueFree(301, 1, buf, wasm2go.Inv_301_1)
 		h.ptr = 0
 	}
 }
@@ -67812,7 +67913,7 @@ func (h *ASTIntOrUnbounded) Bound() (ASTExpressionNode, error) {
 func (h *ASTIntOrUnbounded) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(302, 1, buf, wasm2go.Inv_302_1)
+		module().enqueueFree(302, 1, buf, wasm2go.Inv_302_1)
 		h.ptr = 0
 	}
 }
@@ -67866,7 +67967,7 @@ func (h *ASTIntervalExpr) IntervalValue() (ASTExpressionNode, error) {
 func (h *ASTIntervalExpr) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(303, 3, buf, wasm2go.Inv_303_3)
+		module().enqueueFree(303, 3, buf, wasm2go.Inv_303_3)
 		h.ptr = 0
 	}
 }
@@ -67930,7 +68031,7 @@ func (h *ASTIntoAlias) Identifier() (*ASTIdentifier, error) {
 func (h *ASTIntoAlias) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(304, 4, buf, wasm2go.Inv_304_4)
+		module().enqueueFree(304, 4, buf, wasm2go.Inv_304_4)
 		h.ptr = 0
 	}
 }
@@ -67966,7 +68067,7 @@ func (h *ASTJSONLiteral) StringLiteral() (*ASTStringLiteral, error) {
 func (h *ASTJSONLiteral) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(305, 1, buf, wasm2go.Inv_305_1)
+		module().enqueueFree(305, 1, buf, wasm2go.Inv_305_1)
 		h.ptr = 0
 	}
 }
@@ -68185,7 +68286,7 @@ func (h *ASTJoin) UsingClause() (*ASTUsingClause, error) {
 func (h *ASTJoin) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(306, 22, buf, wasm2go.Inv_306_22)
+		module().enqueueFree(306, 22, buf, wasm2go.Inv_306_22)
 		h.ptr = 0
 	}
 }
@@ -68221,7 +68322,7 @@ func (h *ASTLabel) Name() (*ASTIdentifier, error) {
 func (h *ASTLabel) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(307, 1, buf, wasm2go.Inv_307_1)
+		module().enqueueFree(307, 1, buf, wasm2go.Inv_307_1)
 		h.ptr = 0
 	}
 }
@@ -68267,7 +68368,7 @@ func (h *ASTLambda) Body() (ASTExpressionNode, error) {
 func (h *ASTLambda) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(308, 2, buf, wasm2go.Inv_308_2)
+		module().enqueueFree(308, 2, buf, wasm2go.Inv_308_2)
 		h.ptr = 0
 	}
 }
@@ -68323,7 +68424,7 @@ func (h *ASTLeaf) IsLeaf() (bool, error) {
 func (h *ASTLeaf) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(309, 1, buf, wasm2go.Inv_309_1)
+		module().enqueueFree(309, 1, buf, wasm2go.Inv_309_1)
 		h.ptr = 0
 	}
 }
@@ -68458,7 +68559,7 @@ func (h *ASTLikeExpression) UnnestExpr() (*ASTUnnestExpression, error) {
 func (h *ASTLikeExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(310, 11, buf, wasm2go.Inv_310_11)
+		module().enqueueFree(310, 11, buf, wasm2go.Inv_310_11)
 		h.ptr = 0
 	}
 }
@@ -68506,7 +68607,7 @@ func (h *ASTLimit) Expression() (ASTExpressionNode, error) {
 func (h *ASTLimit) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(311, 2, buf, wasm2go.Inv_311_2)
+		module().enqueueFree(311, 2, buf, wasm2go.Inv_311_2)
 		h.ptr = 0
 	}
 }
@@ -68535,7 +68636,7 @@ func newASTLimitAllNoFinalizer(ptr uint64) *ASTLimitAll {
 func (h *ASTLimitAll) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(312, 0, buf, wasm2go.Inv_312_0)
+		module().enqueueFree(312, 0, buf, wasm2go.Inv_312_0)
 		h.ptr = 0
 	}
 }
@@ -68604,7 +68705,7 @@ func (h *ASTLimitOffset) Offset() (ASTExpressionNode, error) {
 func (h *ASTLimitOffset) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(313, 4, buf, wasm2go.Inv_313_4)
+		module().enqueueFree(313, 4, buf, wasm2go.Inv_313_4)
 		h.ptr = 0
 	}
 }
@@ -68633,7 +68734,7 @@ func newASTLocationNoFinalizer(ptr uint64) *ASTLocation {
 func (h *ASTLocation) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(314, 0, buf, wasm2go.Inv_314_0)
+		module().enqueueFree(314, 0, buf, wasm2go.Inv_314_0)
 		h.ptr = 0
 	}
 }
@@ -68677,7 +68778,7 @@ func (h *ASTLockMode) Strength() (ASTLockModeEnums_LockStrengthSpec, error) {
 func (h *ASTLockMode) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(315, 2, buf, wasm2go.Inv_315_2)
+		module().enqueueFree(315, 2, buf, wasm2go.Inv_315_2)
 		h.ptr = 0
 	}
 }
@@ -68737,7 +68838,7 @@ func (h *ASTLoopStatement) Label() (*ASTLabel, error) {
 func (h *ASTLoopStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(316, 3, buf, wasm2go.Inv_316_3)
+		module().enqueueFree(316, 3, buf, wasm2go.Inv_316_3)
 		h.ptr = 0
 	}
 }
@@ -68765,7 +68866,7 @@ func newASTMacroBodyNoFinalizer(ptr uint64) *ASTMacroBody {
 func (h *ASTMacroBody) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(317, 0, buf, wasm2go.Inv_317_0)
+		module().enqueueFree(317, 0, buf, wasm2go.Inv_317_0)
 		h.ptr = 0
 	}
 }
@@ -68810,7 +68911,7 @@ func (h *ASTMapColumnSchema) ValueSchema() (ASTColumnSchemaNode, error) {
 func (h *ASTMapColumnSchema) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(318, 2, buf, wasm2go.Inv_318_2)
+		module().enqueueFree(318, 2, buf, wasm2go.Inv_318_2)
 		h.ptr = 0
 	}
 }
@@ -68873,7 +68974,7 @@ func (h *ASTMapType) ValueType() (ASTTypeNode, error) {
 func (h *ASTMapType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(319, 4, buf, wasm2go.Inv_319_4)
+		module().enqueueFree(319, 4, buf, wasm2go.Inv_319_4)
 		h.ptr = 0
 	}
 }
@@ -68982,7 +69083,7 @@ func (h *ASTMatchRecognizeClause) PatternVariableDefinitionList() (*ASTSelectLis
 func (h *ASTMatchRecognizeClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(320, 9, buf, wasm2go.Inv_320_9)
+		module().enqueueFree(320, 9, buf, wasm2go.Inv_320_9)
 		h.ptr = 0
 	}
 }
@@ -69011,7 +69112,7 @@ func newASTMaxLiteralNoFinalizer(ptr uint64) *ASTMaxLiteral {
 func (h *ASTMaxLiteral) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(321, 0, buf, wasm2go.Inv_321_0)
+		module().enqueueFree(321, 0, buf, wasm2go.Inv_321_0)
 		h.ptr = 0
 	}
 }
@@ -69097,7 +69198,7 @@ func (h *ASTMergeAction) UpdateItemList() (*ASTUpdateItemList, error) {
 func (h *ASTMergeAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(322, 6, buf, wasm2go.Inv_322_6)
+		module().enqueueFree(322, 6, buf, wasm2go.Inv_322_6)
 		h.ptr = 0
 	}
 }
@@ -69169,7 +69270,7 @@ func (h *ASTMergeStatement) WhenClauses() (*ASTMergeWhenClauseList, error) {
 func (h *ASTMergeStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(323, 5, buf, wasm2go.Inv_323_5)
+		module().enqueueFree(323, 5, buf, wasm2go.Inv_323_5)
 		h.ptr = 0
 	}
 }
@@ -69248,7 +69349,7 @@ func (h *ASTMergeWhenClause) SetMatchType(matchType ASTMergeWhenClauseEnums_Matc
 func (h *ASTMergeWhenClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(324, 6, buf, wasm2go.Inv_324_6)
+		module().enqueueFree(324, 6, buf, wasm2go.Inv_324_6)
 		h.ptr = 0
 	}
 }
@@ -69285,7 +69386,7 @@ func (h *ASTMergeWhenClauseList) ClauseList(i int32) (*ASTMergeWhenClause, error
 func (h *ASTMergeWhenClauseList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(325, 1, buf, wasm2go.Inv_325_1)
+		module().enqueueFree(325, 1, buf, wasm2go.Inv_325_1)
 		h.ptr = 0
 	}
 }
@@ -69325,7 +69426,7 @@ func (h *ASTModelClause) ModelPath() (*ASTPathExpression, error) {
 func (h *ASTModelClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(326, 1, buf, wasm2go.Inv_326_1)
+		module().enqueueFree(326, 1, buf, wasm2go.Inv_326_1)
 		h.ptr = 0
 	}
 }
@@ -69370,7 +69471,7 @@ func (h *ASTModuleStatement) OptionsList() (*ASTOptionsList, error) {
 func (h *ASTModuleStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(327, 2, buf, wasm2go.Inv_327_2)
+		module().enqueueFree(327, 2, buf, wasm2go.Inv_327_2)
 		h.ptr = 0
 	}
 }
@@ -69418,7 +69519,7 @@ func (h *ASTNamedArgument) Name() (*ASTIdentifier, error) {
 func (h *ASTNamedArgument) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(328, 2, buf, wasm2go.Inv_328_2)
+		module().enqueueFree(328, 2, buf, wasm2go.Inv_328_2)
 		h.ptr = 0
 	}
 }
@@ -69474,7 +69575,7 @@ func (h *ASTNewConstructor) TypeName() (*ASTSimpleType, error) {
 func (h *ASTNewConstructor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(329, 3, buf, wasm2go.Inv_329_3)
+		module().enqueueFree(329, 3, buf, wasm2go.Inv_329_3)
 		h.ptr = 0
 	}
 }
@@ -69530,7 +69631,7 @@ func (h *ASTNewConstructorArg) OptionalPathExpression() (*ASTPathExpression, err
 func (h *ASTNewConstructorArg) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(330, 3, buf, wasm2go.Inv_330_3)
+		module().enqueueFree(330, 3, buf, wasm2go.Inv_330_3)
 		h.ptr = 0
 	}
 }
@@ -70040,7 +70141,7 @@ func (h *ASTNodeBase) StartLocation() (*ParseLocationPoint, error) {
 func (h *ASTNodeBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(331, 40, buf, wasm2go.Inv_331_40)
+		module().enqueueFree(331, 40, buf, wasm2go.Inv_331_40)
 		h.ptr = 0
 	}
 }
@@ -70132,7 +70233,7 @@ func (h *ASTNodeFactory) IdStringPool() (*IdStringPool, error) {
 func (h *ASTNodeFactory) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1441, 4, buf, wasm2go.Inv_1441_4)
+		module().enqueueFree(1441, 4, buf, wasm2go.Inv_1441_4)
 		h.ptr = 0
 	}
 }
@@ -70168,7 +70269,7 @@ func (h *ASTNotNullColumnAttribute) SingleNodeSqlString() (string, error) {
 func (h *ASTNotNullColumnAttribute) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(332, 1, buf, wasm2go.Inv_332_1)
+		module().enqueueFree(332, 1, buf, wasm2go.Inv_332_1)
 		h.ptr = 0
 	}
 }
@@ -70195,7 +70296,7 @@ func newASTNullLiteralNoFinalizer(ptr uint64) *ASTNullLiteral {
 func (h *ASTNullLiteral) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(333, 0, buf, wasm2go.Inv_333_0)
+		module().enqueueFree(333, 0, buf, wasm2go.Inv_333_0)
 		h.ptr = 0
 	}
 }
@@ -70247,7 +70348,7 @@ func (h *ASTNullOrder) SetNullsFirst(nullsFirst bool) error {
 func (h *ASTNullOrder) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(334, 3, buf, wasm2go.Inv_334_3)
+		module().enqueueFree(334, 3, buf, wasm2go.Inv_334_3)
 		h.ptr = 0
 	}
 }
@@ -70283,7 +70384,7 @@ func (h *ASTNumericLiteral) StringLiteral() (*ASTStringLiteral, error) {
 func (h *ASTNumericLiteral) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(335, 1, buf, wasm2go.Inv_335_1)
+		module().enqueueFree(335, 1, buf, wasm2go.Inv_335_1)
 		h.ptr = 0
 	}
 }
@@ -70319,7 +70420,7 @@ func (h *ASTOnClause) Expression() (ASTExpressionNode, error) {
 func (h *ASTOnClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(336, 1, buf, wasm2go.Inv_336_1)
+		module().enqueueFree(336, 1, buf, wasm2go.Inv_336_1)
 		h.ptr = 0
 	}
 }
@@ -70432,7 +70533,7 @@ func (h *ASTOnConflictClause) UpdateWhereClause() (ASTExpressionNode, error) {
 func (h *ASTOnConflictClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(337, 8, buf, wasm2go.Inv_337_8)
+		module().enqueueFree(337, 8, buf, wasm2go.Inv_337_8)
 		h.ptr = 0
 	}
 }
@@ -70469,7 +70570,7 @@ func (h *ASTOnOrUsingClauseList) OnOrUsingClauseList(i int32) (ASTNode, error) {
 func (h *ASTOnOrUsingClauseList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(338, 1, buf, wasm2go.Inv_338_1)
+		module().enqueueFree(338, 1, buf, wasm2go.Inv_338_1)
 		h.ptr = 0
 	}
 }
@@ -70543,7 +70644,7 @@ func (h *ASTOptionsEntry) Value() (ASTExpressionNode, error) {
 func (h *ASTOptionsEntry) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(339, 5, buf, wasm2go.Inv_339_5)
+		module().enqueueFree(339, 5, buf, wasm2go.Inv_339_5)
 		h.ptr = 0
 	}
 }
@@ -70580,7 +70681,7 @@ func (h *ASTOptionsList) OptionsEntries(i int32) (*ASTOptionsEntry, error) {
 func (h *ASTOptionsList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(340, 1, buf, wasm2go.Inv_340_1)
+		module().enqueueFree(340, 1, buf, wasm2go.Inv_340_1)
 		h.ptr = 0
 	}
 }
@@ -70626,7 +70727,7 @@ func (h *ASTOrExpr) Disjuncts(i int32) (ASTExpressionNode, error) {
 func (h *ASTOrExpr) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(341, 2, buf, wasm2go.Inv_341_2)
+		module().enqueueFree(341, 2, buf, wasm2go.Inv_341_2)
 		h.ptr = 0
 	}
 }
@@ -70672,7 +70773,7 @@ func (h *ASTOrderBy) OrderingExpressions(i int32) (*ASTOrderingExpression, error
 func (h *ASTOrderBy) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(342, 2, buf, wasm2go.Inv_342_2)
+		module().enqueueFree(342, 2, buf, wasm2go.Inv_342_2)
 		h.ptr = 0
 	}
 }
@@ -70769,7 +70870,7 @@ func (h *ASTOrderingExpression) SetOrderingSpec(orderingSpec ASTOrderingExpressi
 func (h *ASTOrderingExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(343, 8, buf, wasm2go.Inv_343_8)
+		module().enqueueFree(343, 8, buf, wasm2go.Inv_343_8)
 		h.ptr = 0
 	}
 }
@@ -70820,7 +70921,7 @@ func (h *ASTParameterAssignment) Parameter() (*ASTParameterExpr, error) {
 func (h *ASTParameterAssignment) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(344, 2, buf, wasm2go.Inv_344_2)
+		module().enqueueFree(344, 2, buf, wasm2go.Inv_344_2)
 		h.ptr = 0
 	}
 }
@@ -70881,7 +70982,7 @@ func (h *ASTParameterExpr) SetPosition(position int32) error {
 func (h *ASTParameterExpr) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(345, 4, buf, wasm2go.Inv_345_4)
+		module().enqueueFree(345, 4, buf, wasm2go.Inv_345_4)
 		h.ptr = 0
 	}
 }
@@ -70910,7 +71011,7 @@ func newASTParameterExprBaseNoFinalizer(ptr uint64) *ASTParameterExprBase {
 func (h *ASTParameterExprBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(346, 0, buf, wasm2go.Inv_346_0)
+		module().enqueueFree(346, 0, buf, wasm2go.Inv_346_0)
 		h.ptr = 0
 	}
 }
@@ -70946,7 +71047,7 @@ func (h *ASTParenthesizedJoin) Join() (*ASTJoin, error) {
 func (h *ASTParenthesizedJoin) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(347, 1, buf, wasm2go.Inv_347_1)
+		module().enqueueFree(347, 1, buf, wasm2go.Inv_347_1)
 		h.ptr = 0
 	}
 }
@@ -70992,7 +71093,7 @@ func (h *ASTPartitionBy) PartitioningExpressions(i int32) (ASTExpressionNode, er
 func (h *ASTPartitionBy) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(348, 2, buf, wasm2go.Inv_348_2)
+		module().enqueueFree(348, 2, buf, wasm2go.Inv_348_2)
 		h.ptr = 0
 	}
 }
@@ -71120,7 +71221,7 @@ func (h *ASTPathExpression) NumNames() (int32, error) {
 func (h *ASTPathExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(349, 7, buf, wasm2go.Inv_349_7)
+		module().enqueueFree(349, 7, buf, wasm2go.Inv_349_7)
 		h.ptr = 0
 	}
 }
@@ -71157,7 +71258,7 @@ func (h *ASTPathExpressionList) PathExpressionList(i int32) (*ASTPathExpression,
 func (h *ASTPathExpressionList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(350, 1, buf, wasm2go.Inv_350_1)
+		module().enqueueFree(350, 1, buf, wasm2go.Inv_350_1)
 		h.ptr = 0
 	}
 }
@@ -71218,7 +71319,7 @@ func (h *ASTPipeAggregate) WithModifier() (*ASTWithModifier, error) {
 func (h *ASTPipeAggregate) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(351, 3, buf, wasm2go.Inv_351_3)
+		module().enqueueFree(351, 3, buf, wasm2go.Inv_351_3)
 		h.ptr = 0
 	}
 }
@@ -71254,7 +71355,7 @@ func (h *ASTPipeAs) Alias() (*ASTAlias, error) {
 func (h *ASTPipeAs) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(352, 1, buf, wasm2go.Inv_352_1)
+		module().enqueueFree(352, 1, buf, wasm2go.Inv_352_1)
 		h.ptr = 0
 	}
 }
@@ -71300,7 +71401,7 @@ func (h *ASTPipeAssert) MessageList(i int32) (ASTExpressionNode, error) {
 func (h *ASTPipeAssert) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(353, 2, buf, wasm2go.Inv_353_2)
+		module().enqueueFree(353, 2, buf, wasm2go.Inv_353_2)
 		h.ptr = 0
 	}
 }
@@ -71336,7 +71437,7 @@ func (h *ASTPipeCall) Tvf() (*ASTTVF, error) {
 func (h *ASTPipeCall) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(354, 1, buf, wasm2go.Inv_354_1)
+		module().enqueueFree(354, 1, buf, wasm2go.Inv_354_1)
 		h.ptr = 0
 	}
 }
@@ -71372,7 +71473,7 @@ func (h *ASTPipeCreateTable) CreateTableStatement() (*ASTCreateTableStatement, e
 func (h *ASTPipeCreateTable) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(355, 1, buf, wasm2go.Inv_355_1)
+		module().enqueueFree(355, 1, buf, wasm2go.Inv_355_1)
 		h.ptr = 0
 	}
 }
@@ -71399,7 +71500,7 @@ func newASTPipeDescribeNoFinalizer(ptr uint64) *ASTPipeDescribe {
 func (h *ASTPipeDescribe) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(356, 0, buf, wasm2go.Inv_356_0)
+		module().enqueueFree(356, 0, buf, wasm2go.Inv_356_0)
 		h.ptr = 0
 	}
 }
@@ -71426,7 +71527,7 @@ func newASTPipeDistinctNoFinalizer(ptr uint64) *ASTPipeDistinct {
 func (h *ASTPipeDistinct) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(357, 0, buf, wasm2go.Inv_357_0)
+		module().enqueueFree(357, 0, buf, wasm2go.Inv_357_0)
 		h.ptr = 0
 	}
 }
@@ -71462,7 +71563,7 @@ func (h *ASTPipeDrop) ColumnList() (*ASTIdentifierList, error) {
 func (h *ASTPipeDrop) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(358, 1, buf, wasm2go.Inv_358_1)
+		module().enqueueFree(358, 1, buf, wasm2go.Inv_358_1)
 		h.ptr = 0
 	}
 }
@@ -71498,7 +71599,7 @@ func (h *ASTPipeExportData) ExportDataStatement() (*ASTExportDataStatement, erro
 func (h *ASTPipeExportData) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(359, 1, buf, wasm2go.Inv_359_1)
+		module().enqueueFree(359, 1, buf, wasm2go.Inv_359_1)
 		h.ptr = 0
 	}
 }
@@ -71539,7 +71640,7 @@ func (h *ASTPipeExtend) Select() (*ASTSelect, error) {
 func (h *ASTPipeExtend) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(360, 1, buf, wasm2go.Inv_360_1)
+		module().enqueueFree(360, 1, buf, wasm2go.Inv_360_1)
 		h.ptr = 0
 	}
 }
@@ -71585,7 +71686,7 @@ func (h *ASTPipeFork) SubpipelineList(i int32) (*ASTSubpipeline, error) {
 func (h *ASTPipeFork) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(361, 2, buf, wasm2go.Inv_361_2)
+		module().enqueueFree(361, 2, buf, wasm2go.Inv_361_2)
 		h.ptr = 0
 	}
 }
@@ -71642,7 +71743,7 @@ func (h *ASTPipeIf) IfCases(i int32) (*ASTPipeIfCase, error) {
 func (h *ASTPipeIf) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(362, 3, buf, wasm2go.Inv_362_3)
+		module().enqueueFree(362, 3, buf, wasm2go.Inv_362_3)
 		h.ptr = 0
 	}
 }
@@ -71687,7 +71788,7 @@ func (h *ASTPipeIfCase) Subpipeline() (*ASTSubpipeline, error) {
 func (h *ASTPipeIfCase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(363, 2, buf, wasm2go.Inv_363_2)
+		module().enqueueFree(363, 2, buf, wasm2go.Inv_363_2)
 		h.ptr = 0
 	}
 }
@@ -71723,7 +71824,7 @@ func (h *ASTPipeInsert) InsertStatement() (*ASTInsertStatement, error) {
 func (h *ASTPipeInsert) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(364, 1, buf, wasm2go.Inv_364_1)
+		module().enqueueFree(364, 1, buf, wasm2go.Inv_364_1)
 		h.ptr = 0
 	}
 }
@@ -71761,7 +71862,7 @@ func (h *ASTPipeJoin) Join() (*ASTJoin, error) {
 func (h *ASTPipeJoin) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(365, 1, buf, wasm2go.Inv_365_1)
+		module().enqueueFree(365, 1, buf, wasm2go.Inv_365_1)
 		h.ptr = 0
 	}
 }
@@ -71790,7 +71891,7 @@ func newASTPipeJoinLhsPlaceholderNoFinalizer(ptr uint64) *ASTPipeJoinLhsPlacehol
 func (h *ASTPipeJoinLhsPlaceholder) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(366, 0, buf, wasm2go.Inv_366_0)
+		module().enqueueFree(366, 0, buf, wasm2go.Inv_366_0)
 		h.ptr = 0
 	}
 }
@@ -71826,7 +71927,7 @@ func (h *ASTPipeLimitOffset) LimitOffset() (*ASTLimitOffset, error) {
 func (h *ASTPipeLimitOffset) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(367, 1, buf, wasm2go.Inv_367_1)
+		module().enqueueFree(367, 1, buf, wasm2go.Inv_367_1)
 		h.ptr = 0
 	}
 }
@@ -71871,7 +71972,7 @@ func (h *ASTPipeLog) Subpipeline() (*ASTSubpipeline, error) {
 func (h *ASTPipeLog) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(368, 2, buf, wasm2go.Inv_368_2)
+		module().enqueueFree(368, 2, buf, wasm2go.Inv_368_2)
 		h.ptr = 0
 	}
 }
@@ -71907,7 +72008,7 @@ func (h *ASTPipeMatchRecognize) MatchRecognize() (*ASTMatchRecognizeClause, erro
 func (h *ASTPipeMatchRecognize) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(369, 1, buf, wasm2go.Inv_369_1)
+		module().enqueueFree(369, 1, buf, wasm2go.Inv_369_1)
 		h.ptr = 0
 	}
 }
@@ -71938,7 +72039,7 @@ func newASTPipeOperatorNoFinalizer(ptr uint64) *ASTPipeOperator {
 func (h *ASTPipeOperator) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(370, 0, buf, wasm2go.Inv_370_0)
+		module().enqueueFree(370, 0, buf, wasm2go.Inv_370_0)
 		h.ptr = 0
 	}
 }
@@ -71974,7 +72075,7 @@ func (h *ASTPipeOrderBy) OrderBy() (*ASTOrderBy, error) {
 func (h *ASTPipeOrderBy) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(371, 1, buf, wasm2go.Inv_371_1)
+		module().enqueueFree(371, 1, buf, wasm2go.Inv_371_1)
 		h.ptr = 0
 	}
 }
@@ -72010,7 +72111,7 @@ func (h *ASTPipePivot) PivotClause() (*ASTPivotClause, error) {
 func (h *ASTPipePivot) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(372, 1, buf, wasm2go.Inv_372_1)
+		module().enqueueFree(372, 1, buf, wasm2go.Inv_372_1)
 		h.ptr = 0
 	}
 }
@@ -72157,7 +72258,7 @@ func (h *ASTPipeRecursiveUnion) RecursionDepthModifier() (*ASTRecursionDepthModi
 func (h *ASTPipeRecursiveUnion) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(373, 5, buf, wasm2go.Inv_373_5)
+		module().enqueueFree(373, 5, buf, wasm2go.Inv_373_5)
 		h.ptr = 0
 	}
 }
@@ -72194,7 +72295,7 @@ func (h *ASTPipeRename) RenameItemList(i int32) (*ASTPipeRenameItem, error) {
 func (h *ASTPipeRename) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(374, 1, buf, wasm2go.Inv_374_1)
+		module().enqueueFree(374, 1, buf, wasm2go.Inv_374_1)
 		h.ptr = 0
 	}
 }
@@ -72239,7 +72340,7 @@ func (h *ASTPipeRenameItem) OldName() (*ASTIdentifier, error) {
 func (h *ASTPipeRenameItem) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(375, 2, buf, wasm2go.Inv_375_2)
+		module().enqueueFree(375, 2, buf, wasm2go.Inv_375_2)
 		h.ptr = 0
 	}
 }
@@ -72279,7 +72380,7 @@ func (h *ASTPipeSelect) Select() (*ASTSelect, error) {
 func (h *ASTPipeSelect) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(376, 1, buf, wasm2go.Inv_376_1)
+		module().enqueueFree(376, 1, buf, wasm2go.Inv_376_1)
 		h.ptr = 0
 	}
 }
@@ -72316,7 +72417,7 @@ func (h *ASTPipeSet) SetItemList(i int32) (*ASTPipeSetItem, error) {
 func (h *ASTPipeSet) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(377, 1, buf, wasm2go.Inv_377_1)
+		module().enqueueFree(377, 1, buf, wasm2go.Inv_377_1)
 		h.ptr = 0
 	}
 }
@@ -72361,7 +72462,7 @@ func (h *ASTPipeSetItem) Expression() (ASTExpressionNode, error) {
 func (h *ASTPipeSetItem) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(378, 2, buf, wasm2go.Inv_378_2)
+		module().enqueueFree(378, 2, buf, wasm2go.Inv_378_2)
 		h.ptr = 0
 	}
 }
@@ -72416,7 +72517,7 @@ func (h *ASTPipeSetOperation) Metadata() (*ASTSetOperationMetadata, error) {
 func (h *ASTPipeSetOperation) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(379, 2, buf, wasm2go.Inv_379_2)
+		module().enqueueFree(379, 2, buf, wasm2go.Inv_379_2)
 		h.ptr = 0
 	}
 }
@@ -72443,7 +72544,7 @@ func newASTPipeStaticDescribeNoFinalizer(ptr uint64) *ASTPipeStaticDescribe {
 func (h *ASTPipeStaticDescribe) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(380, 0, buf, wasm2go.Inv_380_0)
+		module().enqueueFree(380, 0, buf, wasm2go.Inv_380_0)
 		h.ptr = 0
 	}
 }
@@ -72479,7 +72580,7 @@ func (h *ASTPipeTablesample) Sample() (*ASTSampleClause, error) {
 func (h *ASTPipeTablesample) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(381, 1, buf, wasm2go.Inv_381_1)
+		module().enqueueFree(381, 1, buf, wasm2go.Inv_381_1)
 		h.ptr = 0
 	}
 }
@@ -72525,7 +72626,7 @@ func (h *ASTPipeTee) SubpipelineList(i int32) (*ASTSubpipeline, error) {
 func (h *ASTPipeTee) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(382, 2, buf, wasm2go.Inv_382_2)
+		module().enqueueFree(382, 2, buf, wasm2go.Inv_382_2)
 		h.ptr = 0
 	}
 }
@@ -72561,7 +72662,7 @@ func (h *ASTPipeUnpivot) UnpivotClause() (*ASTUnpivotClause, error) {
 func (h *ASTPipeUnpivot) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(383, 1, buf, wasm2go.Inv_383_1)
+		module().enqueueFree(383, 1, buf, wasm2go.Inv_383_1)
 		h.ptr = 0
 	}
 }
@@ -72597,7 +72698,7 @@ func (h *ASTPipeWhere) Where() (*ASTWhereClause, error) {
 func (h *ASTPipeWhere) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(384, 1, buf, wasm2go.Inv_384_1)
+		module().enqueueFree(384, 1, buf, wasm2go.Inv_384_1)
 		h.ptr = 0
 	}
 }
@@ -72638,7 +72739,7 @@ func (h *ASTPipeWindow) Select() (*ASTSelect, error) {
 func (h *ASTPipeWindow) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(385, 1, buf, wasm2go.Inv_385_1)
+		module().enqueueFree(385, 1, buf, wasm2go.Inv_385_1)
 		h.ptr = 0
 	}
 }
@@ -72674,7 +72775,7 @@ func (h *ASTPipeWith) WithClause() (*ASTWithClause, error) {
 func (h *ASTPipeWith) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(386, 1, buf, wasm2go.Inv_386_1)
+		module().enqueueFree(386, 1, buf, wasm2go.Inv_386_1)
 		h.ptr = 0
 	}
 }
@@ -72746,7 +72847,7 @@ func (h *ASTPivotClause) PivotValues() (*ASTPivotValueList, error) {
 func (h *ASTPivotClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(387, 5, buf, wasm2go.Inv_387_5)
+		module().enqueueFree(387, 5, buf, wasm2go.Inv_387_5)
 		h.ptr = 0
 	}
 }
@@ -72791,7 +72892,7 @@ func (h *ASTPivotExpression) Expression() (ASTExpressionNode, error) {
 func (h *ASTPivotExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(388, 2, buf, wasm2go.Inv_388_2)
+		module().enqueueFree(388, 2, buf, wasm2go.Inv_388_2)
 		h.ptr = 0
 	}
 }
@@ -72828,7 +72929,7 @@ func (h *ASTPivotExpressionList) Expressions(i int32) (*ASTPivotExpression, erro
 func (h *ASTPivotExpressionList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(389, 1, buf, wasm2go.Inv_389_1)
+		module().enqueueFree(389, 1, buf, wasm2go.Inv_389_1)
 		h.ptr = 0
 	}
 }
@@ -72873,7 +72974,7 @@ func (h *ASTPivotValue) Value() (ASTExpressionNode, error) {
 func (h *ASTPivotValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(390, 2, buf, wasm2go.Inv_390_2)
+		module().enqueueFree(390, 2, buf, wasm2go.Inv_390_2)
 		h.ptr = 0
 	}
 }
@@ -72910,7 +73011,7 @@ func (h *ASTPivotValueList) Values(i int32) (*ASTPivotValue, error) {
 func (h *ASTPivotValueList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(391, 1, buf, wasm2go.Inv_391_1)
+		module().enqueueFree(391, 1, buf, wasm2go.Inv_391_1)
 		h.ptr = 0
 	}
 }
@@ -72950,7 +73051,7 @@ func (h *ASTPostfixTableOperator) Name() (string, error) {
 func (h *ASTPostfixTableOperator) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(392, 1, buf, wasm2go.Inv_392_1)
+		module().enqueueFree(392, 1, buf, wasm2go.Inv_392_1)
 		h.ptr = 0
 	}
 }
@@ -73029,7 +73130,7 @@ func (h *ASTPrimaryKey) SetEnforced(enforced bool) error {
 func (h *ASTPrimaryKey) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(393, 6, buf, wasm2go.Inv_393_6)
+		module().enqueueFree(393, 6, buf, wasm2go.Inv_393_6)
 		h.ptr = 0
 	}
 }
@@ -73090,7 +73191,7 @@ func (h *ASTPrimaryKeyColumnAttribute) SetEnforced(enforced bool) error {
 func (h *ASTPrimaryKeyColumnAttribute) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(394, 4, buf, wasm2go.Inv_394_4)
+		module().enqueueFree(394, 4, buf, wasm2go.Inv_394_4)
 		h.ptr = 0
 	}
 }
@@ -73178,7 +73279,7 @@ func (h *ASTPrimaryKeyElement) SetOrderingSpec(orderingSpec ASTOrderingExpressio
 func (h *ASTPrimaryKeyElement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(395, 7, buf, wasm2go.Inv_395_7)
+		module().enqueueFree(395, 7, buf, wasm2go.Inv_395_7)
 		h.ptr = 0
 	}
 }
@@ -73215,7 +73316,7 @@ func (h *ASTPrimaryKeyElementList) Elements(i int32) (*ASTPrimaryKeyElement, err
 func (h *ASTPrimaryKeyElementList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(396, 1, buf, wasm2go.Inv_396_1)
+		module().enqueueFree(396, 1, buf, wasm2go.Inv_396_1)
 		h.ptr = 0
 	}
 }
@@ -73279,7 +73380,7 @@ func (h *ASTPrintableLeaf) SetImage(image string) error {
 func (h *ASTPrintableLeaf) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(397, 3, buf, wasm2go.Inv_397_3)
+		module().enqueueFree(397, 3, buf, wasm2go.Inv_397_3)
 		h.ptr = 0
 	}
 }
@@ -73324,7 +73425,7 @@ func (h *ASTPrivilege) PrivilegeAction() (*ASTIdentifier, error) {
 func (h *ASTPrivilege) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(398, 2, buf, wasm2go.Inv_398_2)
+		module().enqueueFree(398, 2, buf, wasm2go.Inv_398_2)
 		h.ptr = 0
 	}
 }
@@ -73373,7 +73474,7 @@ func (h *ASTPrivileges) Privileges(i int32) (*ASTPrivilege, error) {
 func (h *ASTPrivileges) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(399, 2, buf, wasm2go.Inv_399_2)
+		module().enqueueFree(399, 2, buf, wasm2go.Inv_399_2)
 		h.ptr = 0
 	}
 }
@@ -73409,7 +73510,7 @@ func (h *ASTQualify) Expression() (ASTExpressionNode, error) {
 func (h *ASTQualify) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(400, 1, buf, wasm2go.Inv_400_1)
+		module().enqueueFree(400, 1, buf, wasm2go.Inv_400_1)
 		h.ptr = 0
 	}
 }
@@ -73562,7 +73663,7 @@ func (h *ASTQuantifiedComparisonExpression) UnnestExpr() (*ASTUnnestExpression, 
 func (h *ASTQuantifiedComparisonExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(401, 12, buf, wasm2go.Inv_401_12)
+		module().enqueueFree(401, 12, buf, wasm2go.Inv_401_12)
 		h.ptr = 0
 	}
 }
@@ -73627,7 +73728,7 @@ func (h *ASTQuantifier) SetIsReluctant(isReluctant bool) error {
 func (h *ASTQuantifier) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(402, 4, buf, wasm2go.Inv_402_4)
+		module().enqueueFree(402, 4, buf, wasm2go.Inv_402_4)
 		h.ptr = 0
 	}
 }
@@ -73665,7 +73766,7 @@ func (h *ASTQuantifierBound) Bound() (ASTExpressionNode, error) {
 func (h *ASTQuantifierBound) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(403, 1, buf, wasm2go.Inv_403_1)
+		module().enqueueFree(403, 1, buf, wasm2go.Inv_403_1)
 		h.ptr = 0
 	}
 }
@@ -73804,7 +73905,7 @@ func (h *ASTQuery) WithClause() (*ASTWithClause, error) {
 func (h *ASTQuery) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(404, 11, buf, wasm2go.Inv_404_11)
+		module().enqueueFree(404, 11, buf, wasm2go.Inv_404_11)
 		h.ptr = 0
 	}
 }
@@ -73861,7 +73962,7 @@ func (h *ASTQueryExpression) SetParenthesized(parenthesized bool) error {
 func (h *ASTQueryExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(405, 3, buf, wasm2go.Inv_405_3)
+		module().enqueueFree(405, 3, buf, wasm2go.Inv_405_3)
 		h.ptr = 0
 	}
 }
@@ -73898,7 +73999,7 @@ func (h *ASTQueryStatement) Query() (*ASTQuery, error) {
 func (h *ASTQueryStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(406, 1, buf, wasm2go.Inv_406_1)
+		module().enqueueFree(406, 1, buf, wasm2go.Inv_406_1)
 		h.ptr = 0
 	}
 }
@@ -73948,7 +74049,7 @@ func (h *ASTRaiseStatement) Message() (ASTExpressionNode, error) {
 func (h *ASTRaiseStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(407, 2, buf, wasm2go.Inv_407_2)
+		module().enqueueFree(407, 2, buf, wasm2go.Inv_407_2)
 		h.ptr = 0
 	}
 }
@@ -73975,7 +74076,7 @@ func newASTRangeColumnSchemaNoFinalizer(ptr uint64) *ASTRangeColumnSchema {
 func (h *ASTRangeColumnSchema) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(408, 0, buf, wasm2go.Inv_408_0)
+		module().enqueueFree(408, 0, buf, wasm2go.Inv_408_0)
 		h.ptr = 0
 	}
 }
@@ -74037,7 +74138,7 @@ func (h *ASTRangeLiteral) Type() (*ASTRangeType, error) {
 func (h *ASTRangeLiteral) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(409, 2, buf, wasm2go.Inv_409_2)
+		module().enqueueFree(409, 2, buf, wasm2go.Inv_409_2)
 		h.ptr = 0
 	}
 }
@@ -74091,7 +74192,7 @@ func (h *ASTRangeType) TypeParameters() (*ASTTypeParameterList, error) {
 func (h *ASTRangeType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(410, 3, buf, wasm2go.Inv_410_3)
+		module().enqueueFree(410, 3, buf, wasm2go.Inv_410_3)
 		h.ptr = 0
 	}
 }
@@ -74128,7 +74229,7 @@ func (h *ASTRebuildAction) GetSQLForAlterAction() (string, error) {
 func (h *ASTRebuildAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(411, 1, buf, wasm2go.Inv_411_1)
+		module().enqueueFree(411, 1, buf, wasm2go.Inv_411_1)
 		h.ptr = 0
 	}
 }
@@ -74184,7 +74285,7 @@ func (h *ASTRecursionDepthModifier) UpperBound() (*ASTIntOrUnbounded, error) {
 func (h *ASTRecursionDepthModifier) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(412, 3, buf, wasm2go.Inv_412_3)
+		module().enqueueFree(412, 3, buf, wasm2go.Inv_412_3)
 		h.ptr = 0
 	}
 }
@@ -74246,7 +74347,7 @@ func (h *ASTRemoveFromRestricteeListClause) SetIsIfExists(isIfExists bool) error
 func (h *ASTRemoveFromRestricteeListClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(413, 4, buf, wasm2go.Inv_413_4)
+		module().enqueueFree(413, 4, buf, wasm2go.Inv_413_4)
 		h.ptr = 0
 	}
 }
@@ -74326,7 +74427,7 @@ func (h *ASTRenameColumnAction) SetIsIfExists(isIfExists bool) error {
 func (h *ASTRenameColumnAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(414, 6, buf, wasm2go.Inv_414_6)
+		module().enqueueFree(414, 6, buf, wasm2go.Inv_414_6)
 		h.ptr = 0
 	}
 }
@@ -74381,7 +74482,7 @@ func (h *ASTRenameStatement) OldName() (*ASTPathExpression, error) {
 func (h *ASTRenameStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(415, 3, buf, wasm2go.Inv_415_3)
+		module().enqueueFree(415, 3, buf, wasm2go.Inv_415_3)
 		h.ptr = 0
 	}
 }
@@ -74428,7 +74529,7 @@ func (h *ASTRenameToClause) NewName() (*ASTPathExpression, error) {
 func (h *ASTRenameToClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(416, 2, buf, wasm2go.Inv_416_2)
+		module().enqueueFree(416, 2, buf, wasm2go.Inv_416_2)
 		h.ptr = 0
 	}
 }
@@ -74467,7 +74568,7 @@ func (h *ASTRepeatStatement) UntilClause() (*ASTUntilClause, error) {
 func (h *ASTRepeatStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(417, 1, buf, wasm2go.Inv_417_1)
+		module().enqueueFree(417, 1, buf, wasm2go.Inv_417_1)
 		h.ptr = 0
 	}
 }
@@ -74503,7 +74604,7 @@ func (h *ASTRepeatableClause) Argument() (ASTExpressionNode, error) {
 func (h *ASTRepeatableClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(418, 1, buf, wasm2go.Inv_418_1)
+		module().enqueueFree(418, 1, buf, wasm2go.Inv_418_1)
 		h.ptr = 0
 	}
 }
@@ -74548,7 +74649,7 @@ func (h *ASTReplaceFieldsArg) PathExpression() (ASTGeneralizedPathExpressionNode
 func (h *ASTReplaceFieldsArg) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(419, 2, buf, wasm2go.Inv_419_2)
+		module().enqueueFree(419, 2, buf, wasm2go.Inv_419_2)
 		h.ptr = 0
 	}
 }
@@ -74594,7 +74695,7 @@ func (h *ASTReplaceFieldsExpression) Expr() (ASTExpressionNode, error) {
 func (h *ASTReplaceFieldsExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(420, 2, buf, wasm2go.Inv_420_2)
+		module().enqueueFree(420, 2, buf, wasm2go.Inv_420_2)
 		h.ptr = 0
 	}
 }
@@ -74656,7 +74757,7 @@ func (h *ASTReplaceTtlAction) SetIsIfExists(isIfExists bool) error {
 func (h *ASTReplaceTtlAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(421, 4, buf, wasm2go.Inv_421_4)
+		module().enqueueFree(421, 4, buf, wasm2go.Inv_421_4)
 		h.ptr = 0
 	}
 }
@@ -74703,7 +74804,7 @@ func (h *ASTRestrictToClause) RestricteeList() (*ASTGranteeList, error) {
 func (h *ASTRestrictToClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(422, 2, buf, wasm2go.Inv_422_2)
+		module().enqueueFree(422, 2, buf, wasm2go.Inv_422_2)
 		h.ptr = 0
 	}
 }
@@ -74730,7 +74831,7 @@ func newASTReturnStatementNoFinalizer(ptr uint64) *ASTReturnStatement {
 func (h *ASTReturnStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(423, 0, buf, wasm2go.Inv_423_0)
+		module().enqueueFree(423, 0, buf, wasm2go.Inv_423_0)
 		h.ptr = 0
 	}
 }
@@ -74777,7 +74878,7 @@ func (h *ASTReturningClause) SelectList() (*ASTSelectList, error) {
 func (h *ASTReturningClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(424, 2, buf, wasm2go.Inv_424_2)
+		module().enqueueFree(424, 2, buf, wasm2go.Inv_424_2)
 		h.ptr = 0
 	}
 }
@@ -74848,7 +74949,7 @@ func (h *ASTRevokeFromClause) SetIsRevokeFromAll(isRevokeFromAll bool) error {
 func (h *ASTRevokeFromClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(425, 5, buf, wasm2go.Inv_425_5)
+		module().enqueueFree(425, 5, buf, wasm2go.Inv_425_5)
 		h.ptr = 0
 	}
 }
@@ -74921,7 +75022,7 @@ func (h *ASTRevokeStatement) TargetTypeParts(i int32) (*ASTIdentifier, error) {
 func (h *ASTRevokeStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(426, 5, buf, wasm2go.Inv_426_5)
+		module().enqueueFree(426, 5, buf, wasm2go.Inv_426_5)
 		h.ptr = 0
 	}
 }
@@ -74949,7 +75050,7 @@ func newASTRollbackStatementNoFinalizer(ptr uint64) *ASTRollbackStatement {
 func (h *ASTRollbackStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(427, 0, buf, wasm2go.Inv_427_0)
+		module().enqueueFree(427, 0, buf, wasm2go.Inv_427_0)
 		h.ptr = 0
 	}
 }
@@ -74986,7 +75087,7 @@ func (h *ASTRollup) Expressions(i int32) (ASTExpressionNode, error) {
 func (h *ASTRollup) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(428, 1, buf, wasm2go.Inv_428_1)
+		module().enqueueFree(428, 1, buf, wasm2go.Inv_428_1)
 		h.ptr = 0
 	}
 }
@@ -75033,7 +75134,7 @@ func (h *ASTRowPatternAnchor) SetAnchor(anchor ASTRowPatternAnchorEnums_Anchor) 
 func (h *ASTRowPatternAnchor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(429, 2, buf, wasm2go.Inv_429_2)
+		module().enqueueFree(429, 2, buf, wasm2go.Inv_429_2)
 		h.ptr = 0
 	}
 }
@@ -75079,7 +75180,7 @@ func (h *ASTRowPatternExpression) SetParenthesized(parenthesized bool) error {
 func (h *ASTRowPatternExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(430, 2, buf, wasm2go.Inv_430_2)
+		module().enqueueFree(430, 2, buf, wasm2go.Inv_430_2)
 		h.ptr = 0
 	}
 }
@@ -75136,7 +75237,7 @@ func (h *ASTRowPatternOperation) SetOpType(opType ASTRowPatternOperationEnums_Op
 func (h *ASTRowPatternOperation) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(431, 3, buf, wasm2go.Inv_431_3)
+		module().enqueueFree(431, 3, buf, wasm2go.Inv_431_3)
 		h.ptr = 0
 	}
 }
@@ -75184,7 +75285,7 @@ func (h *ASTRowPatternQuantification) Quantifier() (ASTQuantifierNode, error) {
 func (h *ASTRowPatternQuantification) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(432, 2, buf, wasm2go.Inv_432_2)
+		module().enqueueFree(432, 2, buf, wasm2go.Inv_432_2)
 		h.ptr = 0
 	}
 }
@@ -75220,7 +75321,7 @@ func (h *ASTRowPatternVariable) Name() (*ASTIdentifier, error) {
 func (h *ASTRowPatternVariable) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(433, 1, buf, wasm2go.Inv_433_1)
+		module().enqueueFree(433, 1, buf, wasm2go.Inv_433_1)
 		h.ptr = 0
 	}
 }
@@ -75247,7 +75348,7 @@ func newASTRunBatchStatementNoFinalizer(ptr uint64) *ASTRunBatchStatement {
 func (h *ASTRunBatchStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(434, 0, buf, wasm2go.Inv_434_0)
+		module().enqueueFree(434, 0, buf, wasm2go.Inv_434_0)
 		h.ptr = 0
 	}
 }
@@ -75338,7 +75439,7 @@ func (h *ASTRunStatement) TargetStringLiteral() (*ASTStringLiteral, error) {
 func (h *ASTRunStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(435, 3, buf, wasm2go.Inv_435_3)
+		module().enqueueFree(435, 3, buf, wasm2go.Inv_435_3)
 		h.ptr = 0
 	}
 }
@@ -75401,7 +75502,7 @@ func (h *ASTSampleClause) SampleSuffix() (*ASTSampleSuffix, error) {
 func (h *ASTSampleClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(436, 4, buf, wasm2go.Inv_436_4)
+		module().enqueueFree(436, 4, buf, wasm2go.Inv_436_4)
 		h.ptr = 0
 	}
 }
@@ -75474,7 +75575,7 @@ func (h *ASTSampleSize) Unit() (ASTSampleSizeEnums_Unit, error) {
 func (h *ASTSampleSize) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(437, 5, buf, wasm2go.Inv_437_5)
+		module().enqueueFree(437, 5, buf, wasm2go.Inv_437_5)
 		h.ptr = 0
 	}
 }
@@ -75520,7 +75621,7 @@ func (h *ASTSampleSuffix) Weight() (*ASTWithWeight, error) {
 func (h *ASTSampleSuffix) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(438, 2, buf, wasm2go.Inv_438_2)
+		module().enqueueFree(438, 2, buf, wasm2go.Inv_438_2)
 		h.ptr = 0
 	}
 }
@@ -75557,7 +75658,7 @@ func (h *ASTScript) StatementListNode() (*ASTStatementList, error) {
 func (h *ASTScript) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(439, 1, buf, wasm2go.Inv_439_1)
+		module().enqueueFree(439, 1, buf, wasm2go.Inv_439_1)
 		h.ptr = 0
 	}
 }
@@ -75604,7 +75705,7 @@ func (h *ASTScriptStatement) IsSqlStatement() (bool, error) {
 func (h *ASTScriptStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(440, 2, buf, wasm2go.Inv_440_2)
+		module().enqueueFree(440, 2, buf, wasm2go.Inv_440_2)
 		h.ptr = 0
 	}
 }
@@ -75755,7 +75856,7 @@ func (h *ASTSelect) WithModifier() (*ASTWithModifier, error) {
 func (h *ASTSelect) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(441, 14, buf, wasm2go.Inv_441_14)
+		module().enqueueFree(441, 14, buf, wasm2go.Inv_441_14)
 		h.ptr = 0
 	}
 }
@@ -75844,7 +75945,7 @@ func (h *ASTSelectAs) TypeName() (*ASTPathExpression, error) {
 func (h *ASTSelectAs) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(442, 6, buf, wasm2go.Inv_442_6)
+		module().enqueueFree(442, 6, buf, wasm2go.Inv_442_6)
 		h.ptr = 0
 	}
 }
@@ -75902,7 +76003,7 @@ func (h *ASTSelectColumn) GroupingItemOrder() (*ASTGroupingItemOrder, error) {
 func (h *ASTSelectColumn) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(443, 3, buf, wasm2go.Inv_443_3)
+		module().enqueueFree(443, 3, buf, wasm2go.Inv_443_3)
 		h.ptr = 0
 	}
 }
@@ -75944,7 +76045,7 @@ func (h *ASTSelectList) Columns(i int32) (*ASTSelectColumn, error) {
 func (h *ASTSelectList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(444, 1, buf, wasm2go.Inv_444_1)
+		module().enqueueFree(444, 1, buf, wasm2go.Inv_444_1)
 		h.ptr = 0
 	}
 }
@@ -75984,7 +76085,7 @@ func (h *ASTSequenceArg) SequencePath() (*ASTPathExpression, error) {
 func (h *ASTSequenceArg) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(445, 1, buf, wasm2go.Inv_445_1)
+		module().enqueueFree(445, 1, buf, wasm2go.Inv_445_1)
 		h.ptr = 0
 	}
 }
@@ -76039,7 +76140,7 @@ func (h *ASTSetAsAction) TextBody() (*ASTStringLiteral, error) {
 func (h *ASTSetAsAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(446, 3, buf, wasm2go.Inv_446_3)
+		module().enqueueFree(446, 3, buf, wasm2go.Inv_446_3)
 		h.ptr = 0
 	}
 }
@@ -76085,7 +76186,7 @@ func (h *ASTSetCollateClause) Collate() (*ASTCollate, error) {
 func (h *ASTSetCollateClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(447, 2, buf, wasm2go.Inv_447_2)
+		module().enqueueFree(447, 2, buf, wasm2go.Inv_447_2)
 		h.ptr = 0
 	}
 }
@@ -76140,7 +76241,7 @@ func (h *ASTSetOperation) Metadata() (*ASTSetOperationMetadataList, error) {
 func (h *ASTSetOperation) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(448, 3, buf, wasm2go.Inv_448_3)
+		module().enqueueFree(448, 3, buf, wasm2go.Inv_448_3)
 		h.ptr = 0
 	}
 }
@@ -76185,7 +76286,7 @@ func (h *ASTSetOperationAllOrDistinct) Value() (ASTSetOperationEnums_AllOrDistin
 func (h *ASTSetOperationAllOrDistinct) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(449, 2, buf, wasm2go.Inv_449_2)
+		module().enqueueFree(449, 2, buf, wasm2go.Inv_449_2)
 		h.ptr = 0
 	}
 }
@@ -76230,7 +76331,7 @@ func (h *ASTSetOperationColumnMatchMode) Value() (ASTSetOperationEnums_ColumnMat
 func (h *ASTSetOperationColumnMatchMode) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(450, 2, buf, wasm2go.Inv_450_2)
+		module().enqueueFree(450, 2, buf, wasm2go.Inv_450_2)
 		h.ptr = 0
 	}
 }
@@ -76275,7 +76376,7 @@ func (h *ASTSetOperationColumnPropagationMode) Value() (ASTSetOperationEnums_Col
 func (h *ASTSetOperationColumnPropagationMode) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(451, 2, buf, wasm2go.Inv_451_2)
+		module().enqueueFree(451, 2, buf, wasm2go.Inv_451_2)
 		h.ptr = 0
 	}
 }
@@ -76368,7 +76469,7 @@ func (h *ASTSetOperationMetadata) OpType() (*ASTSetOperationType, error) {
 func (h *ASTSetOperationMetadata) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(452, 7, buf, wasm2go.Inv_452_7)
+		module().enqueueFree(452, 7, buf, wasm2go.Inv_452_7)
 		h.ptr = 0
 	}
 }
@@ -76419,7 +76520,7 @@ func (h *ASTSetOperationMetadataList) SetOperationMetadataList(i int32) (*ASTSet
 func (h *ASTSetOperationMetadataList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(453, 1, buf, wasm2go.Inv_453_1)
+		module().enqueueFree(453, 1, buf, wasm2go.Inv_453_1)
 		h.ptr = 0
 	}
 }
@@ -76464,7 +76565,7 @@ func (h *ASTSetOperationType) Value() (ASTSetOperationEnums_OperationType, error
 func (h *ASTSetOperationType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(454, 2, buf, wasm2go.Inv_454_2)
+		module().enqueueFree(454, 2, buf, wasm2go.Inv_454_2)
 		h.ptr = 0
 	}
 }
@@ -76510,7 +76611,7 @@ func (h *ASTSetOptionsAction) OptionsList() (*ASTOptionsList, error) {
 func (h *ASTSetOptionsAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(455, 2, buf, wasm2go.Inv_455_2)
+		module().enqueueFree(455, 2, buf, wasm2go.Inv_455_2)
 		h.ptr = 0
 	}
 }
@@ -76547,7 +76648,7 @@ func (h *ASTSetTransactionStatement) ModeList() (*ASTTransactionModeList, error)
 func (h *ASTSetTransactionStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(456, 1, buf, wasm2go.Inv_456_1)
+		module().enqueueFree(456, 1, buf, wasm2go.Inv_456_1)
 		h.ptr = 0
 	}
 }
@@ -76602,7 +76703,7 @@ func (h *ASTShowStatement) OptionalName() (*ASTPathExpression, error) {
 func (h *ASTShowStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(457, 3, buf, wasm2go.Inv_457_3)
+		module().enqueueFree(457, 3, buf, wasm2go.Inv_457_3)
 		h.ptr = 0
 	}
 }
@@ -76638,7 +76739,7 @@ func (h *ASTSimpleColumnSchema) TypeName() (*ASTPathExpression, error) {
 func (h *ASTSimpleColumnSchema) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(458, 1, buf, wasm2go.Inv_458_1)
+		module().enqueueFree(458, 1, buf, wasm2go.Inv_458_1)
 		h.ptr = 0
 	}
 }
@@ -76694,7 +76795,7 @@ func (h *ASTSimpleType) TypeParameters() (*ASTTypeParameterList, error) {
 func (h *ASTSimpleType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(459, 3, buf, wasm2go.Inv_459_3)
+		module().enqueueFree(459, 3, buf, wasm2go.Inv_459_3)
 		h.ptr = 0
 	}
 }
@@ -76743,7 +76844,7 @@ func (h *ASTSingleAssignment) Variable() (*ASTIdentifier, error) {
 func (h *ASTSingleAssignment) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(460, 2, buf, wasm2go.Inv_460_2)
+		module().enqueueFree(460, 2, buf, wasm2go.Inv_460_2)
 		h.ptr = 0
 	}
 }
@@ -76789,7 +76890,7 @@ func (h *ASTSpannerAlterColumnAction) ColumnDefinition() (*ASTColumnDefinition, 
 func (h *ASTSpannerAlterColumnAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(461, 2, buf, wasm2go.Inv_461_2)
+		module().enqueueFree(461, 2, buf, wasm2go.Inv_461_2)
 		h.ptr = 0
 	}
 }
@@ -76858,7 +76959,7 @@ func (h *ASTSpannerInterleaveClause) Type() (ASTSpannerInterleaveClauseEnums_Typ
 func (h *ASTSpannerInterleaveClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(462, 5, buf, wasm2go.Inv_462_5)
+		module().enqueueFree(462, 5, buf, wasm2go.Inv_462_5)
 		h.ptr = 0
 	}
 }
@@ -76911,7 +77012,7 @@ func (h *ASTSpannerSetOnDeleteAction) SetAction(action ASTForeignKeyActionsEnums
 func (h *ASTSpannerSetOnDeleteAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(463, 3, buf, wasm2go.Inv_463_3)
+		module().enqueueFree(463, 3, buf, wasm2go.Inv_463_3)
 		h.ptr = 0
 	}
 }
@@ -76957,7 +77058,7 @@ func (h *ASTSpannerTableOptions) PrimaryKey() (*ASTPrimaryKey, error) {
 func (h *ASTSpannerTableOptions) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(464, 2, buf, wasm2go.Inv_464_2)
+		module().enqueueFree(464, 2, buf, wasm2go.Inv_464_2)
 		h.ptr = 0
 	}
 }
@@ -76993,7 +77094,7 @@ func (h *ASTSqlFunctionBody) Expression() (ASTExpressionNode, error) {
 func (h *ASTSqlFunctionBody) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(465, 1, buf, wasm2go.Inv_465_1)
+		module().enqueueFree(465, 1, buf, wasm2go.Inv_465_1)
 		h.ptr = 0
 	}
 }
@@ -77020,7 +77121,7 @@ func newASTStarNoFinalizer(ptr uint64) *ASTStar {
 func (h *ASTStar) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(466, 0, buf, wasm2go.Inv_466_0)
+		module().enqueueFree(466, 0, buf, wasm2go.Inv_466_0)
 		h.ptr = 0
 	}
 }
@@ -77057,7 +77158,7 @@ func (h *ASTStarExceptList) Identifiers(i int32) (*ASTIdentifier, error) {
 func (h *ASTStarExceptList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(467, 1, buf, wasm2go.Inv_467_1)
+		module().enqueueFree(467, 1, buf, wasm2go.Inv_467_1)
 		h.ptr = 0
 	}
 }
@@ -77104,7 +77205,7 @@ func (h *ASTStarModifiers) ReplaceItems(i int32) (*ASTStarReplaceItem, error) {
 func (h *ASTStarModifiers) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(468, 2, buf, wasm2go.Inv_468_2)
+		module().enqueueFree(468, 2, buf, wasm2go.Inv_468_2)
 		h.ptr = 0
 	}
 }
@@ -77149,7 +77250,7 @@ func (h *ASTStarReplaceItem) Expression() (ASTExpressionNode, error) {
 func (h *ASTStarReplaceItem) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(469, 2, buf, wasm2go.Inv_469_2)
+		module().enqueueFree(469, 2, buf, wasm2go.Inv_469_2)
 		h.ptr = 0
 	}
 }
@@ -77186,7 +77287,7 @@ func (h *ASTStarWithModifiers) Modifiers() (*ASTStarModifiers, error) {
 func (h *ASTStarWithModifiers) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(470, 1, buf, wasm2go.Inv_470_1)
+		module().enqueueFree(470, 1, buf, wasm2go.Inv_470_1)
 		h.ptr = 0
 	}
 }
@@ -77222,7 +77323,7 @@ func (h *ASTStartBatchStatement) BatchType() (*ASTIdentifier, error) {
 func (h *ASTStartBatchStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(471, 1, buf, wasm2go.Inv_471_1)
+		module().enqueueFree(471, 1, buf, wasm2go.Inv_471_1)
 		h.ptr = 0
 	}
 }
@@ -77270,7 +77371,7 @@ func (h *ASTStatement) IsStatement() (bool, error) {
 func (h *ASTStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(472, 2, buf, wasm2go.Inv_472_2)
+		module().enqueueFree(472, 2, buf, wasm2go.Inv_472_2)
 		h.ptr = 0
 	}
 }
@@ -77325,7 +77426,7 @@ func (h *ASTStatementList) VariableDeclarationsAllowed() (bool, error) {
 func (h *ASTStatementList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(473, 3, buf, wasm2go.Inv_473_3)
+		module().enqueueFree(473, 3, buf, wasm2go.Inv_473_3)
 		h.ptr = 0
 	}
 }
@@ -77379,7 +77480,7 @@ func (h *ASTStatementWithPipeOperators) Statement() (ASTStatementNode, error) {
 func (h *ASTStatementWithPipeOperators) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(474, 2, buf, wasm2go.Inv_474_2)
+		module().enqueueFree(474, 2, buf, wasm2go.Inv_474_2)
 		h.ptr = 0
 	}
 }
@@ -77435,7 +77536,7 @@ func (h *ASTStringLiteral) StringValue() (string, error) {
 func (h *ASTStringLiteral) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(475, 3, buf, wasm2go.Inv_475_3)
+		module().enqueueFree(475, 3, buf, wasm2go.Inv_475_3)
 		h.ptr = 0
 	}
 }
@@ -77480,7 +77581,7 @@ func (h *ASTStringLiteralComponent) StringValue() (string, error) {
 func (h *ASTStringLiteralComponent) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(476, 2, buf, wasm2go.Inv_476_2)
+		module().enqueueFree(476, 2, buf, wasm2go.Inv_476_2)
 		h.ptr = 0
 	}
 }
@@ -77525,7 +77626,7 @@ func (h *ASTStructBracedConstructor) TypeName() (ASTTypeNode, error) {
 func (h *ASTStructBracedConstructor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(477, 2, buf, wasm2go.Inv_477_2)
+		module().enqueueFree(477, 2, buf, wasm2go.Inv_477_2)
 		h.ptr = 0
 	}
 }
@@ -77573,7 +77674,7 @@ func (h *ASTStructColumnField) Schema() (ASTColumnSchemaNode, error) {
 func (h *ASTStructColumnField) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(478, 2, buf, wasm2go.Inv_478_2)
+		module().enqueueFree(478, 2, buf, wasm2go.Inv_478_2)
 		h.ptr = 0
 	}
 }
@@ -77610,7 +77711,7 @@ func (h *ASTStructColumnSchema) StructFields(i int32) (*ASTStructColumnField, er
 func (h *ASTStructColumnSchema) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(479, 1, buf, wasm2go.Inv_479_1)
+		module().enqueueFree(479, 1, buf, wasm2go.Inv_479_1)
 		h.ptr = 0
 	}
 }
@@ -77655,7 +77756,7 @@ func (h *ASTStructConstructorArg) Expression() (ASTExpressionNode, error) {
 func (h *ASTStructConstructorArg) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(480, 2, buf, wasm2go.Inv_480_2)
+		module().enqueueFree(480, 2, buf, wasm2go.Inv_480_2)
 		h.ptr = 0
 	}
 }
@@ -77722,7 +77823,7 @@ func (h *ASTStructConstructorWithKeyword) StructType() (*ASTStructType, error) {
 func (h *ASTStructConstructorWithKeyword) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(481, 3, buf, wasm2go.Inv_481_3)
+		module().enqueueFree(481, 3, buf, wasm2go.Inv_481_3)
 		h.ptr = 0
 	}
 }
@@ -77761,7 +77862,7 @@ func (h *ASTStructConstructorWithParens) FieldExpressions(i int32) (ASTExpressio
 func (h *ASTStructConstructorWithParens) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(482, 1, buf, wasm2go.Inv_482_1)
+		module().enqueueFree(482, 1, buf, wasm2go.Inv_482_1)
 		h.ptr = 0
 	}
 }
@@ -77809,7 +77910,7 @@ func (h *ASTStructField) Type() (ASTTypeNode, error) {
 func (h *ASTStructField) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(483, 2, buf, wasm2go.Inv_483_2)
+		module().enqueueFree(483, 2, buf, wasm2go.Inv_483_2)
 		h.ptr = 0
 	}
 }
@@ -77864,7 +77965,7 @@ func (h *ASTStructType) TypeParameters() (*ASTTypeParameterList, error) {
 func (h *ASTStructType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(484, 3, buf, wasm2go.Inv_484_3)
+		module().enqueueFree(484, 3, buf, wasm2go.Inv_484_3)
 		h.ptr = 0
 	}
 }
@@ -77917,7 +78018,7 @@ func (h *ASTSubpipeline) SetParenthesized(parenthesized bool) error {
 func (h *ASTSubpipeline) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(485, 3, buf, wasm2go.Inv_485_3)
+		module().enqueueFree(485, 3, buf, wasm2go.Inv_485_3)
 		h.ptr = 0
 	}
 }
@@ -77957,7 +78058,7 @@ func (h *ASTSubpipelineStatement) Subpipeline() (*ASTSubpipeline, error) {
 func (h *ASTSubpipelineStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(486, 1, buf, wasm2go.Inv_486_1)
+		module().enqueueFree(486, 1, buf, wasm2go.Inv_486_1)
 		h.ptr = 0
 	}
 }
@@ -78001,7 +78102,7 @@ func (h *ASTSymbolQuantifier) Symbol() (ASTSymbolQuantifierEnums_Symbol, error) 
 func (h *ASTSymbolQuantifier) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(487, 2, buf, wasm2go.Inv_487_2)
+		module().enqueueFree(487, 2, buf, wasm2go.Inv_487_2)
 		h.ptr = 0
 	}
 }
@@ -78053,7 +78154,7 @@ func (h *ASTSystemVariableAssignment) SystemVariable() (*ASTSystemVariableExpr, 
 func (h *ASTSystemVariableAssignment) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(488, 2, buf, wasm2go.Inv_488_2)
+		module().enqueueFree(488, 2, buf, wasm2go.Inv_488_2)
 		h.ptr = 0
 	}
 }
@@ -78089,7 +78190,7 @@ func (h *ASTSystemVariableExpr) Path() (*ASTPathExpression, error) {
 func (h *ASTSystemVariableExpr) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(489, 1, buf, wasm2go.Inv_489_1)
+		module().enqueueFree(489, 1, buf, wasm2go.Inv_489_1)
 		h.ptr = 0
 	}
 }
@@ -78184,7 +78285,7 @@ func (h *ASTTVF) SetIsLateral(isLateral bool) error {
 func (h *ASTTVF) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(490, 7, buf, wasm2go.Inv_490_7)
+		module().enqueueFree(490, 7, buf, wasm2go.Inv_490_7)
 		h.ptr = 0
 	}
 }
@@ -78291,7 +78392,7 @@ func (h *ASTTVFArgument) TableClause() (*ASTTableClause, error) {
 func (h *ASTTVFArgument) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(491, 5, buf, wasm2go.Inv_491_5)
+		module().enqueueFree(491, 5, buf, wasm2go.Inv_491_5)
 		h.ptr = 0
 	}
 }
@@ -78335,7 +78436,7 @@ func (h *ASTTVFSchema) Columns(i int32) (*ASTTVFSchemaColumn, error) {
 func (h *ASTTVFSchema) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(492, 1, buf, wasm2go.Inv_492_1)
+		module().enqueueFree(492, 1, buf, wasm2go.Inv_492_1)
 		h.ptr = 0
 	}
 }
@@ -78383,7 +78484,7 @@ func (h *ASTTVFSchemaColumn) Type() (ASTTypeNode, error) {
 func (h *ASTTVFSchemaColumn) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(493, 2, buf, wasm2go.Inv_493_2)
+		module().enqueueFree(493, 2, buf, wasm2go.Inv_493_2)
 		h.ptr = 0
 	}
 }
@@ -78428,7 +78529,7 @@ func (h *ASTTableAndColumnInfo) TableName() (*ASTPathExpression, error) {
 func (h *ASTTableAndColumnInfo) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(494, 2, buf, wasm2go.Inv_494_2)
+		module().enqueueFree(494, 2, buf, wasm2go.Inv_494_2)
 		h.ptr = 0
 	}
 }
@@ -78465,7 +78566,7 @@ func (h *ASTTableAndColumnInfoList) TableAndColumnInfoEntries(i int32) (*ASTTabl
 func (h *ASTTableAndColumnInfoList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(495, 1, buf, wasm2go.Inv_495_1)
+		module().enqueueFree(495, 1, buf, wasm2go.Inv_495_1)
 		h.ptr = 0
 	}
 }
@@ -78527,7 +78628,7 @@ func (h *ASTTableClause) WhereClause() (*ASTWhereClause, error) {
 func (h *ASTTableClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(496, 3, buf, wasm2go.Inv_496_3)
+		module().enqueueFree(496, 3, buf, wasm2go.Inv_496_3)
 		h.ptr = 0
 	}
 }
@@ -78567,7 +78668,7 @@ func (h *ASTTableConstraint) ConstraintName() (*ASTIdentifier, error) {
 func (h *ASTTableConstraint) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(497, 1, buf, wasm2go.Inv_497_1)
+		module().enqueueFree(497, 1, buf, wasm2go.Inv_497_1)
 		h.ptr = 0
 	}
 }
@@ -78623,7 +78724,7 @@ func (h *ASTTableDataSource) WhereClause() (*ASTWhereClause, error) {
 func (h *ASTTableDataSource) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(498, 3, buf, wasm2go.Inv_498_3)
+		module().enqueueFree(498, 3, buf, wasm2go.Inv_498_3)
 		h.ptr = 0
 	}
 }
@@ -78654,7 +78755,7 @@ func newASTTableElementNoFinalizer(ptr uint64) *ASTTableElement {
 func (h *ASTTableElement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(499, 0, buf, wasm2go.Inv_499_0)
+		module().enqueueFree(499, 0, buf, wasm2go.Inv_499_0)
 		h.ptr = 0
 	}
 }
@@ -78700,7 +78801,7 @@ func (h *ASTTableElementList) Elements(i int32) (ASTTableElementNode, error) {
 func (h *ASTTableElementList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(500, 2, buf, wasm2go.Inv_500_2)
+		module().enqueueFree(500, 2, buf, wasm2go.Inv_500_2)
 		h.ptr = 0
 	}
 }
@@ -78801,7 +78902,7 @@ func (h *ASTTableExpression) UnpivotClause() (*ASTUnpivotClause, error) {
 func (h *ASTTableExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(501, 7, buf, wasm2go.Inv_501_7)
+		module().enqueueFree(501, 7, buf, wasm2go.Inv_501_7)
 		h.ptr = 0
 	}
 }
@@ -78887,7 +78988,7 @@ func (h *ASTTablePathExpression) WithOffset() (*ASTWithOffset, error) {
 func (h *ASTTablePathExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(502, 6, buf, wasm2go.Inv_502_6)
+		module().enqueueFree(502, 6, buf, wasm2go.Inv_502_6)
 		h.ptr = 0
 	}
 }
@@ -78948,7 +79049,7 @@ func (h *ASTTableSubquery) Subquery() (*ASTQuery, error) {
 func (h *ASTTableSubquery) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(503, 4, buf, wasm2go.Inv_503_4)
+		module().enqueueFree(503, 4, buf, wasm2go.Inv_503_4)
 		h.ptr = 0
 	}
 }
@@ -78991,7 +79092,7 @@ func (h *ASTTemplatedParameterType) SetKind(kind ASTTemplatedParameterTypeEnums_
 func (h *ASTTemplatedParameterType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(504, 2, buf, wasm2go.Inv_504_2)
+		module().enqueueFree(504, 2, buf, wasm2go.Inv_504_2)
 		h.ptr = 0
 	}
 }
@@ -79037,7 +79138,7 @@ func (h *ASTTransactionIsolationLevel) Identifier2() (*ASTIdentifier, error) {
 func (h *ASTTransactionIsolationLevel) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(505, 2, buf, wasm2go.Inv_505_2)
+		module().enqueueFree(505, 2, buf, wasm2go.Inv_505_2)
 		h.ptr = 0
 	}
 }
@@ -79067,7 +79168,7 @@ func newASTTransactionModeNoFinalizer(ptr uint64) *ASTTransactionMode {
 func (h *ASTTransactionMode) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(506, 0, buf, wasm2go.Inv_506_0)
+		module().enqueueFree(506, 0, buf, wasm2go.Inv_506_0)
 		h.ptr = 0
 	}
 }
@@ -79104,7 +79205,7 @@ func (h *ASTTransactionModeList) Elements(i int32) (ASTTransactionModeNode, erro
 func (h *ASTTransactionModeList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(507, 1, buf, wasm2go.Inv_507_1)
+		module().enqueueFree(507, 1, buf, wasm2go.Inv_507_1)
 		h.ptr = 0
 	}
 }
@@ -79147,7 +79248,7 @@ func (h *ASTTransactionReadWriteMode) SetMode(mode ASTTransactionReadWriteModeEn
 func (h *ASTTransactionReadWriteMode) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(508, 2, buf, wasm2go.Inv_508_2)
+		module().enqueueFree(508, 2, buf, wasm2go.Inv_508_2)
 		h.ptr = 0
 	}
 }
@@ -79183,7 +79284,7 @@ func (h *ASTTransformClause) SelectList() (*ASTSelectList, error) {
 func (h *ASTTransformClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(509, 1, buf, wasm2go.Inv_509_1)
+		module().enqueueFree(509, 1, buf, wasm2go.Inv_509_1)
 		h.ptr = 0
 	}
 }
@@ -79240,7 +79341,7 @@ func (h *ASTTruncateStatement) Where() (ASTExpressionNode, error) {
 func (h *ASTTruncateStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(510, 3, buf, wasm2go.Inv_510_3)
+		module().enqueueFree(510, 3, buf, wasm2go.Inv_510_3)
 		h.ptr = 0
 	}
 }
@@ -79276,7 +79377,7 @@ func (h *ASTTtlClause) Expression() (ASTExpressionNode, error) {
 func (h *ASTTtlClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(511, 1, buf, wasm2go.Inv_511_1)
+		module().enqueueFree(511, 1, buf, wasm2go.Inv_511_1)
 		h.ptr = 0
 	}
 }
@@ -79332,7 +79433,7 @@ func (h *ASTType) TypeParameters() (*ASTTypeParameterList, error) {
 func (h *ASTType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(512, 3, buf, wasm2go.Inv_512_3)
+		module().enqueueFree(512, 3, buf, wasm2go.Inv_512_3)
 		h.ptr = 0
 	}
 }
@@ -79369,7 +79470,7 @@ func (h *ASTTypeParameterList) Parameters(i int32) (ASTLeafNode, error) {
 func (h *ASTTypeParameterList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(513, 1, buf, wasm2go.Inv_513_1)
+		module().enqueueFree(513, 1, buf, wasm2go.Inv_513_1)
 		h.ptr = 0
 	}
 }
@@ -79448,7 +79549,7 @@ func (h *ASTUnaryExpression) SetOp(op ASTUnaryExpressionEnums_Op) error {
 func (h *ASTUnaryExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(514, 6, buf, wasm2go.Inv_514_6)
+		module().enqueueFree(514, 6, buf, wasm2go.Inv_514_6)
 		h.ptr = 0
 	}
 }
@@ -79544,7 +79645,7 @@ func (h *ASTUndropStatement) SetSchemaObjectKind(schemaObjectKind SchemaObjectKi
 func (h *ASTUndropStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(515, 8, buf, wasm2go.Inv_515_8)
+		module().enqueueFree(515, 8, buf, wasm2go.Inv_515_8)
 		h.ptr = 0
 	}
 }
@@ -79599,7 +79700,7 @@ func (h *ASTUnnestExpression) Expressions(i int32) (*ASTExpressionWithOptAlias, 
 func (h *ASTUnnestExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(516, 3, buf, wasm2go.Inv_516_3)
+		module().enqueueFree(516, 3, buf, wasm2go.Inv_516_3)
 		h.ptr = 0
 	}
 }
@@ -79654,7 +79755,7 @@ func (h *ASTUnnestExpressionWithOptAliasAndOffset) UnnestExpression() (*ASTUnnes
 func (h *ASTUnnestExpressionWithOptAliasAndOffset) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(517, 3, buf, wasm2go.Inv_517_3)
+		module().enqueueFree(517, 3, buf, wasm2go.Inv_517_3)
 		h.ptr = 0
 	}
 }
@@ -79760,7 +79861,7 @@ func (h *ASTUnpivotClause) UnpivotOutputValueColumns() (*ASTPathExpressionList, 
 func (h *ASTUnpivotClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(518, 9, buf, wasm2go.Inv_518_9)
+		module().enqueueFree(518, 9, buf, wasm2go.Inv_518_9)
 		h.ptr = 0
 	}
 }
@@ -79805,7 +79906,7 @@ func (h *ASTUnpivotInItem) UnpivotColumns() (*ASTPathExpressionList, error) {
 func (h *ASTUnpivotInItem) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(519, 2, buf, wasm2go.Inv_519_2)
+		module().enqueueFree(519, 2, buf, wasm2go.Inv_519_2)
 		h.ptr = 0
 	}
 }
@@ -79841,7 +79942,7 @@ func (h *ASTUnpivotInItemLabel) Label() (ASTExpressionNode, error) {
 func (h *ASTUnpivotInItemLabel) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(520, 1, buf, wasm2go.Inv_520_1)
+		module().enqueueFree(520, 1, buf, wasm2go.Inv_520_1)
 		h.ptr = 0
 	}
 }
@@ -79878,7 +79979,7 @@ func (h *ASTUnpivotInItemList) InItems(i int32) (*ASTUnpivotInItem, error) {
 func (h *ASTUnpivotInItemList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(521, 1, buf, wasm2go.Inv_521_1)
+		module().enqueueFree(521, 1, buf, wasm2go.Inv_521_1)
 		h.ptr = 0
 	}
 }
@@ -79926,7 +80027,7 @@ func (h *ASTUntilClause) RepeatStmt() (*ASTRepeatStatement, error) {
 func (h *ASTUntilClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(522, 2, buf, wasm2go.Inv_522_2)
+		module().enqueueFree(522, 2, buf, wasm2go.Inv_522_2)
 		h.ptr = 0
 	}
 }
@@ -79971,7 +80072,7 @@ func (h *ASTUpdateConstructor) Function() (*ASTFunctionCall, error) {
 func (h *ASTUpdateConstructor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(523, 2, buf, wasm2go.Inv_523_2)
+		module().enqueueFree(523, 2, buf, wasm2go.Inv_523_2)
 		h.ptr = 0
 	}
 }
@@ -80034,7 +80135,7 @@ func (h *ASTUpdateItem) UpdateStatement() (*ASTUpdateStatement, error) {
 func (h *ASTUpdateItem) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(524, 4, buf, wasm2go.Inv_524_4)
+		module().enqueueFree(524, 4, buf, wasm2go.Inv_524_4)
 		h.ptr = 0
 	}
 }
@@ -80071,7 +80172,7 @@ func (h *ASTUpdateItemList) UpdateItems(i int32) (*ASTUpdateItem, error) {
 func (h *ASTUpdateItemList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(525, 1, buf, wasm2go.Inv_525_1)
+		module().enqueueFree(525, 1, buf, wasm2go.Inv_525_1)
 		h.ptr = 0
 	}
 }
@@ -80117,7 +80218,7 @@ func (h *ASTUpdateSetValue) Value() (ASTExpressionNode, error) {
 func (h *ASTUpdateSetValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(526, 2, buf, wasm2go.Inv_526_2)
+		module().enqueueFree(526, 2, buf, wasm2go.Inv_526_2)
 		h.ptr = 0
 	}
 }
@@ -80249,7 +80350,7 @@ func (h *ASTUpdateStatement) Where() (ASTExpressionNode, error) {
 func (h *ASTUpdateStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(527, 11, buf, wasm2go.Inv_527_11)
+		module().enqueueFree(527, 11, buf, wasm2go.Inv_527_11)
 		h.ptr = 0
 	}
 }
@@ -80286,7 +80387,7 @@ func (h *ASTUsingClause) Keys(i int32) (*ASTIdentifier, error) {
 func (h *ASTUsingClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(528, 1, buf, wasm2go.Inv_528_1)
+		module().enqueueFree(528, 1, buf, wasm2go.Inv_528_1)
 		h.ptr = 0
 	}
 }
@@ -80347,7 +80448,7 @@ func (h *ASTVariableDeclaration) VariableList() (*ASTIdentifierList, error) {
 func (h *ASTVariableDeclaration) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(529, 3, buf, wasm2go.Inv_529_3)
+		module().enqueueFree(529, 3, buf, wasm2go.Inv_529_3)
 		h.ptr = 0
 	}
 }
@@ -80406,7 +80507,7 @@ func (h *ASTWhenThenClause) Condition() (ASTExpressionNode, error) {
 func (h *ASTWhenThenClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(530, 3, buf, wasm2go.Inv_530_3)
+		module().enqueueFree(530, 3, buf, wasm2go.Inv_530_3)
 		h.ptr = 0
 	}
 }
@@ -80446,7 +80547,7 @@ func (h *ASTWhenThenClauseList) WhenThenClauses(i int32) (*ASTWhenThenClause, er
 func (h *ASTWhenThenClauseList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(531, 1, buf, wasm2go.Inv_531_1)
+		module().enqueueFree(531, 1, buf, wasm2go.Inv_531_1)
 		h.ptr = 0
 	}
 }
@@ -80482,7 +80583,7 @@ func (h *ASTWhereClause) Expression() (ASTExpressionNode, error) {
 func (h *ASTWhereClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(532, 1, buf, wasm2go.Inv_532_1)
+		module().enqueueFree(532, 1, buf, wasm2go.Inv_532_1)
 		h.ptr = 0
 	}
 }
@@ -80528,7 +80629,7 @@ func (h *ASTWhileStatement) Condition() (ASTExpressionNode, error) {
 func (h *ASTWhileStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(533, 1, buf, wasm2go.Inv_533_1)
+		module().enqueueFree(533, 1, buf, wasm2go.Inv_533_1)
 		h.ptr = 0
 	}
 }
@@ -80565,7 +80666,7 @@ func (h *ASTWindowClause) Windows(i int32) (*ASTWindowDefinition, error) {
 func (h *ASTWindowClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(534, 1, buf, wasm2go.Inv_534_1)
+		module().enqueueFree(534, 1, buf, wasm2go.Inv_534_1)
 		h.ptr = 0
 	}
 }
@@ -80610,7 +80711,7 @@ func (h *ASTWindowDefinition) WindowSpec() (*ASTWindowSpecification, error) {
 func (h *ASTWindowDefinition) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(535, 2, buf, wasm2go.Inv_535_2)
+		module().enqueueFree(535, 2, buf, wasm2go.Inv_535_2)
 		h.ptr = 0
 	}
 }
@@ -80689,7 +80790,7 @@ func (h *ASTWindowFrame) StartExpr() (*ASTWindowFrameExpr, error) {
 func (h *ASTWindowFrame) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(536, 6, buf, wasm2go.Inv_536_6)
+		module().enqueueFree(536, 6, buf, wasm2go.Inv_536_6)
 		h.ptr = 0
 	}
 }
@@ -80759,7 +80860,7 @@ func (h *ASTWindowFrameExpr) SetBoundaryType(boundaryType ASTWindowFrameExprEnum
 func (h *ASTWindowFrameExpr) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(537, 5, buf, wasm2go.Inv_537_5)
+		module().enqueueFree(537, 5, buf, wasm2go.Inv_537_5)
 		h.ptr = 0
 	}
 }
@@ -80822,7 +80923,7 @@ func (h *ASTWindowSpecification) WindowFrame() (*ASTWindowFrame, error) {
 func (h *ASTWindowSpecification) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(538, 4, buf, wasm2go.Inv_538_4)
+		module().enqueueFree(538, 4, buf, wasm2go.Inv_538_4)
 		h.ptr = 0
 	}
 }
@@ -80887,7 +80988,7 @@ func (h *ASTWithClause) SetRecursive(recursive bool) error {
 func (h *ASTWithClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(539, 4, buf, wasm2go.Inv_539_4)
+		module().enqueueFree(539, 4, buf, wasm2go.Inv_539_4)
 		h.ptr = 0
 	}
 }
@@ -80939,7 +81040,7 @@ func (h *ASTWithClauseEntry) AliasedQuery() (*ASTAliasedQuery, error) {
 func (h *ASTWithClauseEntry) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(540, 2, buf, wasm2go.Inv_540_2)
+		module().enqueueFree(540, 2, buf, wasm2go.Inv_540_2)
 		h.ptr = 0
 	}
 }
@@ -80975,7 +81076,7 @@ func (h *ASTWithConnectionClause) ConnectionClause() (*ASTConnectionClause, erro
 func (h *ASTWithConnectionClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(541, 1, buf, wasm2go.Inv_541_1)
+		module().enqueueFree(541, 1, buf, wasm2go.Inv_541_1)
 		h.ptr = 0
 	}
 }
@@ -81020,7 +81121,7 @@ func (h *ASTWithExpression) Variables() (*ASTSelectList, error) {
 func (h *ASTWithExpression) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(542, 2, buf, wasm2go.Inv_542_2)
+		module().enqueueFree(542, 2, buf, wasm2go.Inv_542_2)
 		h.ptr = 0
 	}
 }
@@ -81066,7 +81167,7 @@ func (h *ASTWithModifier) Options() (*ASTOptionsList, error) {
 func (h *ASTWithModifier) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(543, 2, buf, wasm2go.Inv_543_2)
+		module().enqueueFree(543, 2, buf, wasm2go.Inv_543_2)
 		h.ptr = 0
 	}
 }
@@ -81103,7 +81204,7 @@ func (h *ASTWithOffset) Alias() (*ASTAlias, error) {
 func (h *ASTWithOffset) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(544, 1, buf, wasm2go.Inv_544_1)
+		module().enqueueFree(544, 1, buf, wasm2go.Inv_544_1)
 		h.ptr = 0
 	}
 }
@@ -81139,7 +81240,7 @@ func (h *ASTWithPartitionColumnsClause) TableElementList() (*ASTTableElementList
 func (h *ASTWithPartitionColumnsClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(545, 1, buf, wasm2go.Inv_545_1)
+		module().enqueueFree(545, 1, buf, wasm2go.Inv_545_1)
 		h.ptr = 0
 	}
 }
@@ -81175,7 +81276,7 @@ func (h *ASTWithReportModifier) OptionsList() (*ASTOptionsList, error) {
 func (h *ASTWithReportModifier) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(546, 1, buf, wasm2go.Inv_546_1)
+		module().enqueueFree(546, 1, buf, wasm2go.Inv_546_1)
 		h.ptr = 0
 	}
 }
@@ -81212,7 +81313,7 @@ func (h *ASTWithWeight) Alias() (*ASTAlias, error) {
 func (h *ASTWithWeight) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(547, 1, buf, wasm2go.Inv_547_1)
+		module().enqueueFree(547, 1, buf, wasm2go.Inv_547_1)
 		h.ptr = 0
 	}
 }
@@ -81250,7 +81351,7 @@ func (h *ASTYieldItemList) YieldItems(i int32) (*ASTExpressionWithOptAlias, erro
 func (h *ASTYieldItemList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(548, 1, buf, wasm2go.Inv_548_1)
+		module().enqueueFree(548, 1, buf, wasm2go.Inv_548_1)
 		h.ptr = 0
 	}
 }
@@ -81629,7 +81730,7 @@ func (h *AllowedHintsAndOptionsProto) SetDisallowUnknownOptions(value bool) erro
 func (h *AllowedHintsAndOptionsProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(549, 41, buf, wasm2go.Inv_549_41)
+		module().enqueueFree(549, 41, buf, wasm2go.Inv_549_41)
 		h.ptr = 0
 	}
 }
@@ -81922,7 +82023,7 @@ func (h *AllowedHintsAndOptionsProto_HintProto) UnsafeArenaSetAllocatedType(valu
 func (h *AllowedHintsAndOptionsProto_HintProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(550, 32, buf, wasm2go.Inv_550_32)
+		module().enqueueFree(550, 32, buf, wasm2go.Inv_550_32)
 		h.ptr = 0
 	}
 }
@@ -82195,7 +82296,7 @@ func (h *AllowedHintsAndOptionsProto_OptionProto) UnsafeArenaSetAllocatedType(va
 func (h *AllowedHintsAndOptionsProto_OptionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(551, 30, buf, wasm2go.Inv_551_30)
+		module().enqueueFree(551, 30, buf, wasm2go.Inv_551_30)
 		h.ptr = 0
 	}
 }
@@ -82420,7 +82521,7 @@ func (h *AnalyzerLogEntry) UnsafeArenaSetAllocatedOverallExecutionStats(value *E
 func (h *AnalyzerLogEntry) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(552, 24, buf, wasm2go.Inv_552_24)
+		module().enqueueFree(552, 24, buf, wasm2go.Inv_552_24)
 		h.ptr = 0
 	}
 }
@@ -82609,7 +82710,7 @@ func (h *AnalyzerLogEntry_ExecutionStatsByOpEntry) Value() (*ExecutionStats, err
 func (h *AnalyzerLogEntry_ExecutionStatsByOpEntry) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(553, 20, buf, wasm2go.Inv_553_20)
+		module().enqueueFree(553, 20, buf, wasm2go.Inv_553_20)
 		h.ptr = 0
 	}
 }
@@ -83658,7 +83759,7 @@ func (h *AnalyzerOptions) TrailingRewriters() ([]RewriterNode, error) {
 func (h *AnalyzerOptions) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(554, 86, buf, wasm2go.Inv_554_86)
+		module().enqueueFree(554, 86, buf, wasm2go.Inv_554_86)
 		h.ptr = 0
 	}
 }
@@ -84851,7 +84952,7 @@ func (h *AnalyzerOptionsProto) UnsafeArenaSetAllocatedRewriteOptions(value *Rewr
 func (h *AnalyzerOptionsProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(555, 139, buf, wasm2go.Inv_555_139)
+		module().enqueueFree(555, 139, buf, wasm2go.Inv_555_139)
 		h.ptr = 0
 	}
 }
@@ -85060,7 +85161,7 @@ func (h *AnalyzerOptionsProto_QueryParameterProto) UnsafeArenaSetAllocatedType(v
 func (h *AnalyzerOptionsProto_QueryParameterProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(556, 22, buf, wasm2go.Inv_556_22)
+		module().enqueueFree(556, 22, buf, wasm2go.Inv_556_22)
 		h.ptr = 0
 	}
 }
@@ -85262,7 +85363,7 @@ func (h *AnalyzerOptionsProto_SystemVariableProto) UnsafeArenaSetAllocatedType(v
 func (h *AnalyzerOptionsProto_SystemVariableProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(557, 21, buf, wasm2go.Inv_557_21)
+		module().enqueueFree(557, 21, buf, wasm2go.Inv_557_21)
 		h.ptr = 0
 	}
 }
@@ -85441,7 +85542,7 @@ func (h *AnalyzerOutput) UndeclaredPositionalParameters() ([]Googlesql_TypeNode,
 func (h *AnalyzerOutput) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(558, 11, buf, wasm2go.Inv_558_11)
+		module().enqueueFree(558, 11, buf, wasm2go.Inv_558_11)
 		h.ptr = 0
 	}
 }
@@ -85525,7 +85626,7 @@ func (h *AnalyzerOutputProperties) GetHasAnonymization() (bool, error) {
 func (h *AnalyzerOutputProperties) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(559, 3, buf, wasm2go.Inv_559_3)
+		module().enqueueFree(559, 3, buf, wasm2go.Inv_559_3)
 		h.ptr = 0
 	}
 }
@@ -85631,7 +85732,7 @@ func (h *AnalyzerRuntimeInfo) ParserRuntimeInfo2() (*ParserRuntimeInfo, error) {
 func (h *AnalyzerRuntimeInfo) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(560, 5, buf, wasm2go.Inv_560_5)
+		module().enqueueFree(560, 5, buf, wasm2go.Inv_560_5)
 		h.ptr = 0
 	}
 }
@@ -85916,7 +86017,7 @@ func (h *AnnotationMap) UnsetAnnotationRecursively(id int32) error {
 func (h *AnnotationMap) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(561, 21, buf, wasm2go.Inv_561_21)
+		module().enqueueFree(561, 21, buf, wasm2go.Inv_561_21)
 		h.ptr = 0
 	}
 }
@@ -86195,7 +86296,7 @@ func (h *AnnotationMapProto) UnsafeArenaSetAllocatedArrayElement(value *Annotati
 func (h *AnnotationMapProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(562, 30, buf, wasm2go.Inv_562_30)
+		module().enqueueFree(562, 30, buf, wasm2go.Inv_562_30)
 		h.ptr = 0
 	}
 }
@@ -86375,7 +86476,7 @@ func (h *AnnotationProto) Value() (*SimpleValueProto, error) {
 func (h *AnnotationProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(563, 19, buf, wasm2go.Inv_563_19)
+		module().enqueueFree(563, 19, buf, wasm2go.Inv_563_19)
 		h.ptr = 0
 	}
 }
@@ -86558,7 +86659,7 @@ func NewAnnotationSpecFromImpl(impl AnnotationSpecCallback) (*AnnotationSpec, er
 func (h *AnnotationSpec) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(564, 10, buf, wasm2go.Inv_564_10)
+		module().enqueueFree(564, 10, buf, wasm2go.Inv_564_10)
 		h.ptr = 0
 	}
 }
@@ -86640,7 +86741,7 @@ func (h *AnonymizationInfo) UserIdColumnNamePath() ([]string, error) {
 func (h *AnonymizationInfo) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(565, 3, buf, wasm2go.Inv_565_3)
+		module().enqueueFree(565, 3, buf, wasm2go.Inv_565_3)
 		h.ptr = 0
 	}
 }
@@ -86723,7 +86824,7 @@ func (h *AnonymizationUserIdInfo) GetColumnNamePath() ([]string, error) {
 func (h *AnonymizationUserIdInfo) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(566, 3, buf, wasm2go.Inv_566_3)
+		module().enqueueFree(566, 3, buf, wasm2go.Inv_566_3)
 		h.ptr = 0
 	}
 }
@@ -87067,7 +87168,7 @@ func (h *AnyResolvedAggregateScanBaseProto) UnsafeArenaSetAllocatedResolvedDiffe
 func (h *AnyResolvedAggregateScanBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(567, 38, buf, wasm2go.Inv_567_38)
+		module().enqueueFree(567, 38, buf, wasm2go.Inv_567_38)
 		h.ptr = 0
 	}
 }
@@ -88617,7 +88718,7 @@ func (h *AnyResolvedAlterActionProto) UnsafeArenaSetAllocatedResolvedSetOptionsA
 func (h *AnyResolvedAlterActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(568, 182, buf, wasm2go.Inv_568_182)
+		module().enqueueFree(568, 182, buf, wasm2go.Inv_568_182)
 		h.ptr = 0
 	}
 }
@@ -89162,7 +89263,7 @@ func (h *AnyResolvedAlterColumnActionProto) UnsafeArenaSetAllocatedResolvedAlter
 func (h *AnyResolvedAlterColumnActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(569, 62, buf, wasm2go.Inv_569_62)
+		module().enqueueFree(569, 62, buf, wasm2go.Inv_569_62)
 		h.ptr = 0
 	}
 }
@@ -90243,7 +90344,7 @@ func (h *AnyResolvedAlterObjectStmtProto) UnsafeArenaSetAllocatedResolvedAlterVi
 func (h *AnyResolvedAlterObjectStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(570, 126, buf, wasm2go.Inv_570_126)
+		module().enqueueFree(570, 126, buf, wasm2go.Inv_570_126)
 		h.ptr = 0
 	}
 }
@@ -95813,7 +95914,7 @@ func (h *AnyResolvedArgumentProto) UnsafeArenaSetAllocatedResolvedWithPartitionC
 func (h *AnyResolvedArgumentProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(571, 662, buf, wasm2go.Inv_571_662)
+		module().enqueueFree(571, 662, buf, wasm2go.Inv_571_662)
 		h.ptr = 0
 	}
 }
@@ -95956,7 +96057,7 @@ func (h *AnyResolvedComputedColumnBaseProto) UnsafeArenaSetAllocatedResolvedComp
 func (h *AnyResolvedComputedColumnBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(572, 14, buf, wasm2go.Inv_572_14)
+		module().enqueueFree(572, 14, buf, wasm2go.Inv_572_14)
 		h.ptr = 0
 	}
 }
@@ -96166,7 +96267,7 @@ func (h *AnyResolvedComputedColumnImplProto) UnsafeArenaSetAllocatedResolvedDefe
 func (h *AnyResolvedComputedColumnImplProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(573, 22, buf, wasm2go.Inv_573_22)
+		module().enqueueFree(573, 22, buf, wasm2go.Inv_573_22)
 		h.ptr = 0
 	}
 }
@@ -96443,7 +96544,7 @@ func (h *AnyResolvedConstraintProto) UnsafeArenaSetAllocatedResolvedPrimaryKeyNo
 func (h *AnyResolvedConstraintProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(574, 30, buf, wasm2go.Inv_574_30)
+		module().enqueueFree(574, 30, buf, wasm2go.Inv_574_30)
 		h.ptr = 0
 	}
 }
@@ -96653,7 +96754,7 @@ func (h *AnyResolvedCreateSchemaStmtBaseProto) UnsafeArenaSetAllocatedResolvedCr
 func (h *AnyResolvedCreateSchemaStmtBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(575, 22, buf, wasm2go.Inv_575_22)
+		module().enqueueFree(575, 22, buf, wasm2go.Inv_575_22)
 		h.ptr = 0
 	}
 }
@@ -97734,7 +97835,7 @@ func (h *AnyResolvedCreateStatementProto) UnsafeArenaSetAllocatedResolvedCreateV
 func (h *AnyResolvedCreateStatementProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(576, 126, buf, wasm2go.Inv_576_126)
+		module().enqueueFree(576, 126, buf, wasm2go.Inv_576_126)
 		h.ptr = 0
 	}
 }
@@ -98011,7 +98112,7 @@ func (h *AnyResolvedCreateTableStmtBaseProto) UnsafeArenaSetAllocatedResolvedCre
 func (h *AnyResolvedCreateTableStmtBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(577, 30, buf, wasm2go.Inv_577_30)
+		module().enqueueFree(577, 30, buf, wasm2go.Inv_577_30)
 		h.ptr = 0
 	}
 }
@@ -98288,7 +98389,7 @@ func (h *AnyResolvedCreateViewBaseProto) UnsafeArenaSetAllocatedResolvedCreateVi
 func (h *AnyResolvedCreateViewBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(578, 30, buf, wasm2go.Inv_578_30)
+		module().enqueueFree(578, 30, buf, wasm2go.Inv_578_30)
 		h.ptr = 0
 	}
 }
@@ -100307,7 +100408,7 @@ func (h *AnyResolvedExprProto) UnsafeArenaSetAllocatedResolvedWithExprNode(value
 func (h *AnyResolvedExprProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(579, 238, buf, wasm2go.Inv_579_238)
+		module().enqueueFree(579, 238, buf, wasm2go.Inv_579_238)
 		h.ptr = 0
 	}
 }
@@ -100517,7 +100618,7 @@ func (h *AnyResolvedFunctionCallBaseProto) UnsafeArenaSetAllocatedResolvedNonSca
 func (h *AnyResolvedFunctionCallBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(580, 22, buf, wasm2go.Inv_580_22)
+		module().enqueueFree(580, 22, buf, wasm2go.Inv_580_22)
 		h.ptr = 0
 	}
 }
@@ -100727,7 +100828,7 @@ func (h *AnyResolvedGrantOrRevokeStmtProto) UnsafeArenaSetAllocatedResolvedRevok
 func (h *AnyResolvedGrantOrRevokeStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(581, 22, buf, wasm2go.Inv_581_22)
+		module().enqueueFree(581, 22, buf, wasm2go.Inv_581_22)
 		h.ptr = 0
 	}
 }
@@ -100937,7 +101038,7 @@ func (h *AnyResolvedGraphElementScanProto) UnsafeArenaSetAllocatedResolvedGraphN
 func (h *AnyResolvedGraphElementScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(582, 22, buf, wasm2go.Inv_582_22)
+		module().enqueueFree(582, 22, buf, wasm2go.Inv_582_22)
 		h.ptr = 0
 	}
 }
@@ -101214,7 +101315,7 @@ func (h *AnyResolvedGraphLabelExprProto) UnsafeArenaSetAllocatedResolvedGraphWil
 func (h *AnyResolvedGraphLabelExprProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(583, 30, buf, wasm2go.Inv_583_30)
+		module().enqueueFree(583, 30, buf, wasm2go.Inv_583_30)
 		h.ptr = 0
 	}
 }
@@ -101424,7 +101525,7 @@ func (h *AnyResolvedGraphPathScanBaseProto) UnsafeArenaSetAllocatedResolvedGraph
 func (h *AnyResolvedGraphPathScanBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(584, 22, buf, wasm2go.Inv_584_22)
+		module().enqueueFree(584, 22, buf, wasm2go.Inv_584_22)
 		h.ptr = 0
 	}
 }
@@ -101634,7 +101735,7 @@ func (h *AnyResolvedGraphScanBaseProto) UnsafeArenaSetAllocatedResolvedGraphScan
 func (h *AnyResolvedGraphScanBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(585, 22, buf, wasm2go.Inv_585_22)
+		module().enqueueFree(585, 22, buf, wasm2go.Inv_585_22)
 		h.ptr = 0
 	}
 }
@@ -102045,7 +102146,7 @@ func (h *AnyResolvedGroupingSetBaseProto) UnsafeArenaSetAllocatedResolvedRollupN
 func (h *AnyResolvedGroupingSetBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(586, 46, buf, wasm2go.Inv_586_46)
+		module().enqueueFree(586, 46, buf, wasm2go.Inv_586_46)
 		h.ptr = 0
 	}
 }
@@ -102456,7 +102557,7 @@ func (h *AnyResolvedMatchRecognizePatternExprProto) UnsafeArenaSetAllocatedResol
 func (h *AnyResolvedMatchRecognizePatternExprProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(587, 46, buf, wasm2go.Inv_587_46)
+		module().enqueueFree(587, 46, buf, wasm2go.Inv_587_46)
 		h.ptr = 0
 	}
 }
@@ -102800,7 +102901,7 @@ func (h *AnyResolvedNodeProto) UnsafeArenaSetAllocatedResolvedStatementNode(valu
 func (h *AnyResolvedNodeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(588, 38, buf, wasm2go.Inv_588_38)
+		module().enqueueFree(588, 38, buf, wasm2go.Inv_588_38)
 		h.ptr = 0
 	}
 }
@@ -103010,7 +103111,7 @@ func (h *AnyResolvedNonScalarFunctionCallBaseProto) UnsafeArenaSetAllocatedResol
 func (h *AnyResolvedNonScalarFunctionCallBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(589, 22, buf, wasm2go.Inv_589_22)
+		module().enqueueFree(589, 22, buf, wasm2go.Inv_589_22)
 		h.ptr = 0
 	}
 }
@@ -105833,7 +105934,7 @@ func (h *AnyResolvedScanProto) UnsafeArenaSetAllocatedResolvedWithScanNode(value
 func (h *AnyResolvedScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(590, 334, buf, wasm2go.Inv_590_334)
+		module().enqueueFree(590, 334, buf, wasm2go.Inv_590_334)
 		h.ptr = 0
 	}
 }
@@ -109259,7 +109360,7 @@ func (h *AnyResolvedStatementProto) UnsafeArenaSetAllocatedResolvedUpdateStmtNod
 func (h *AnyResolvedStatementProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(591, 406, buf, wasm2go.Inv_591_406)
+		module().enqueueFree(591, 406, buf, wasm2go.Inv_591_406)
 		h.ptr = 0
 	}
 }
@@ -109461,7 +109562,7 @@ func (h *ArgumentTypeLambdaProto) UnsafeArenaSetAllocatedBody(value *FunctionArg
 func (h *ArgumentTypeLambdaProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(592, 21, buf, wasm2go.Inv_592_21)
+		module().enqueueFree(592, 21, buf, wasm2go.Inv_592_21)
 		h.ptr = 0
 	}
 }
@@ -109831,7 +109932,7 @@ func (h *ArrayTypeProto) UnsafeArenaSetAllocatedElementType(value *TypeProto) er
 func (h *ArrayTypeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(594, 16, buf, wasm2go.Inv_594_16)
+		module().enqueueFree(594, 16, buf, wasm2go.Inv_594_16)
 		h.ptr = 0
 	}
 }
@@ -109944,7 +110045,7 @@ func (h *BaseArena) IsEmpty() (bool, error) {
 func (h *BaseArena) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1445, 7, buf, wasm2go.Inv_1445_7)
+		module().enqueueFree(1445, 7, buf, wasm2go.Inv_1445_7)
 		h.ptr = 0
 	}
 }
@@ -110450,7 +110551,7 @@ func (h *BigNumericValue) Trunc(digits int64) (*BigNumericValue, error) {
 func (h *BigNumericValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(595, 39, buf, wasm2go.Inv_595_39)
+		module().enqueueFree(595, 39, buf, wasm2go.Inv_595_39)
 		h.ptr = 0
 	}
 }
@@ -110547,7 +110648,7 @@ func (h *BuiltinOnlyCatalog) SetAllowedFunctionGroups(allowedFunctionGroups []st
 func (h *BuiltinOnlyCatalog) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(596, 6, buf, wasm2go.Inv_596_6)
+		module().enqueueFree(596, 6, buf, wasm2go.Inv_596_6)
 		h.ptr = 0
 	}
 }
@@ -110783,7 +110884,7 @@ func NewCatalogFromImpl(impl CatalogCallback) (*Catalog, error) {
 func (h *Catalog) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(597, 11, buf, wasm2go.Inv_597_11)
+		module().enqueueFree(597, 11, buf, wasm2go.Inv_597_11)
 		h.ptr = 0
 	}
 }
@@ -110860,7 +110961,7 @@ func (h *Clock) TimeNow() (*Time, error) {
 func (h *Clock) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1446, 1, buf, wasm2go.Inv_1446_1)
+		module().enqueueFree(1446, 1, buf, wasm2go.Inv_1446_1)
 		h.ptr = 0
 	}
 }
@@ -111112,7 +111213,7 @@ func (h *Collation) NumChildren() (uint64, error) {
 func (h *Collation) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(598, 15, buf, wasm2go.Inv_598_15)
+		module().enqueueFree(598, 15, buf, wasm2go.Inv_598_15)
 		h.ptr = 0
 	}
 }
@@ -111222,7 +111323,7 @@ func (h *CollationAnnotation) ScalarMergeIfCompatible(in *AnnotationMap, out *An
 func (h *CollationAnnotation) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(599, 6, buf, wasm2go.Inv_599_6)
+		module().enqueueFree(599, 6, buf, wasm2go.Inv_599_6)
 		h.ptr = 0
 	}
 }
@@ -111409,7 +111510,7 @@ func (h *CollationProto) SetAllocatedCollationName() (string, error) {
 func (h *CollationProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(600, 19, buf, wasm2go.Inv_600_19)
+		module().enqueueFree(600, 19, buf, wasm2go.Inv_600_19)
 		h.ptr = 0
 	}
 }
@@ -111618,7 +111719,7 @@ func (h *ColumnRefProto) UnsafeArenaSetAllocatedTableRef(value *TableRefProto) e
 func (h *ColumnRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(602, 22, buf, wasm2go.Inv_602_22)
+		module().enqueueFree(602, 22, buf, wasm2go.Inv_602_22)
 		h.ptr = 0
 	}
 }
@@ -111694,7 +111795,7 @@ func NewConnectionFromImpl(impl ConnectionCallback) (*Connection, error) {
 func (h *Connection) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(603, 3, buf, wasm2go.Inv_603_3)
+		module().enqueueFree(603, 3, buf, wasm2go.Inv_603_3)
 		h.ptr = 0
 	}
 }
@@ -111888,7 +111989,7 @@ func (h *ConnectionRefProto) SetAllocatedName() (string, error) {
 func (h *ConnectionRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(604, 20, buf, wasm2go.Inv_604_20)
+		module().enqueueFree(604, 20, buf, wasm2go.Inv_604_20)
 		h.ptr = 0
 	}
 }
@@ -112035,7 +112136,7 @@ func (h *Constant) Type() (Googlesql_TypeNode, error) {
 func (h *Constant) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(605, 8, buf, wasm2go.Inv_605_8)
+		module().enqueueFree(605, 8, buf, wasm2go.Inv_605_8)
 		h.ptr = 0
 	}
 }
@@ -112116,7 +112217,7 @@ func NewConstantEvaluatorFromImpl(impl ConstantEvaluatorCallback) (*ConstantEval
 func (h *ConstantEvaluator) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(606, 3, buf, wasm2go.Inv_606_3)
+		module().enqueueFree(606, 3, buf, wasm2go.Inv_606_3)
 		h.ptr = 0
 	}
 }
@@ -112258,7 +112359,7 @@ func (h *ConstantRefProto) SetAllocatedName() (string, error) {
 func (h *ConstantRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(607, 14, buf, wasm2go.Inv_607_14)
+		module().enqueueFree(607, 14, buf, wasm2go.Inv_607_14)
 		h.ptr = 0
 	}
 }
@@ -112288,7 +112389,7 @@ func newContainerTypeNoFinalizer(ptr uint64) *ContainerType {
 func (h *ContainerType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(608, 0, buf, wasm2go.Inv_608_0)
+		module().enqueueFree(608, 0, buf, wasm2go.Inv_608_0)
 		h.ptr = 0
 	}
 }
@@ -112414,7 +112515,7 @@ func (h *Conversion) ToType() (Googlesql_TypeNode, error) {
 func (h *Conversion) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(609, 7, buf, wasm2go.Inv_609_7)
+		module().enqueueFree(609, 7, buf, wasm2go.Inv_609_7)
 		h.ptr = 0
 	}
 }
@@ -112515,7 +112616,7 @@ func (h *ConversionEvaluator) ToType() (Googlesql_TypeNode, error) {
 func (h *ConversionEvaluator) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(610, 5, buf, wasm2go.Inv_610_5)
+		module().enqueueFree(610, 5, buf, wasm2go.Inv_610_5)
 		h.ptr = 0
 	}
 }
@@ -112640,7 +112741,7 @@ func (h *CycleDetector) Size() (int32, error) {
 func (h *CycleDetector) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(611, 5, buf, wasm2go.Inv_611_5)
+		module().enqueueFree(611, 5, buf, wasm2go.Inv_611_5)
 		h.ptr = 0
 	}
 }
@@ -112972,7 +113073,7 @@ func (h *DatetimeValue) Year() (int32, error) {
 func (h *DatetimeValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(612, 20, buf, wasm2go.Inv_612_20)
+		module().enqueueFree(612, 20, buf, wasm2go.Inv_612_20)
 		h.ptr = 0
 	}
 }
@@ -113143,7 +113244,7 @@ func NewDefaultAnnotationSpecFromImpl(impl DefaultAnnotationSpecCallback) (*Defa
 func (h *DefaultAnnotationSpec) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(613, 10, buf, wasm2go.Inv_613_10)
+		module().enqueueFree(613, 10, buf, wasm2go.Inv_613_10)
 		h.ptr = 0
 	}
 }
@@ -113170,7 +113271,7 @@ func newDefaultParseTreeStatusVisitorNoFinalizer(ptr uint64) *DefaultParseTreeSt
 func (h *DefaultParseTreeStatusVisitor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(614, 0, buf, wasm2go.Inv_614_0)
+		module().enqueueFree(614, 0, buf, wasm2go.Inv_614_0)
 		h.ptr = 0
 	}
 }
@@ -113215,7 +113316,7 @@ func NewDefaultParseTreeVisitorFromImpl(impl DefaultParseTreeVisitorCallback) (*
 func (h *DefaultParseTreeVisitor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(615, 1, buf, wasm2go.Inv_615_1)
+		module().enqueueFree(615, 1, buf, wasm2go.Inv_615_1)
 		h.ptr = 0
 	}
 }
@@ -113337,7 +113438,7 @@ func (h *DeprecationWarning) SetKind(value DeprecationWarning_Kind) error {
 func (h *DeprecationWarning) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(616, 12, buf, wasm2go.Inv_616_12)
+		module().enqueueFree(616, 12, buf, wasm2go.Inv_616_12)
 		h.ptr = 0
 	}
 }
@@ -113842,7 +113943,7 @@ func (h *Descriptor) WellKnownType() (WellKnownType, error) {
 func (h *Descriptor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1, 37, buf, wasm2go.Inv_1_37)
+		module().enqueueFree(1, 37, buf, wasm2go.Inv_1_37)
 		h.ptr = 0
 	}
 }
@@ -114242,7 +114343,7 @@ func (h *DescriptorPool) InternalSetUnderlay(underlay *DescriptorPool) error {
 func (h *DescriptorPool) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(2, 27, buf, wasm2go.Inv_2_27)
+		module().enqueueFree(2, 27, buf, wasm2go.Inv_2_27)
 		h.ptr = 0
 	}
 }
@@ -114396,7 +114497,7 @@ func (h *EnabledRewriteProto) Value() (bool, error) {
 func (h *EnabledRewriteProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(617, 16, buf, wasm2go.Inv_617_16)
+		module().enqueueFree(617, 16, buf, wasm2go.Inv_617_16)
 		h.ptr = 0
 	}
 }
@@ -114608,7 +114709,7 @@ func (h *EnumDescriptor) ValueCount() (int32, error) {
 func (h *EnumDescriptor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(3, 14, buf, wasm2go.Inv_3_14)
+		module().enqueueFree(3, 14, buf, wasm2go.Inv_3_14)
 		h.ptr = 0
 	}
 }
@@ -115158,7 +115259,7 @@ func (h *EnumTypeProto) SetIsOpaque(value bool) error {
 func (h *EnumTypeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(619, 32, buf, wasm2go.Inv_619_32)
+		module().enqueueFree(619, 32, buf, wasm2go.Inv_619_32)
 		h.ptr = 0
 	}
 }
@@ -115249,7 +115350,7 @@ func (h *EnumValueDescriptor) Type() (*EnumDescriptor, error) {
 func (h *EnumValueDescriptor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(4, 5, buf, wasm2go.Inv_4_5)
+		module().enqueueFree(4, 5, buf, wasm2go.Inv_4_5)
 		h.ptr = 0
 	}
 }
@@ -115386,7 +115487,7 @@ func NewEnumerableCatalogFromImpl(impl EnumerableCatalogCallback) (*EnumerableCa
 func (h *EnumerableCatalog) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(620, 10, buf, wasm2go.Inv_620_10)
+		module().enqueueFree(620, 10, buf, wasm2go.Inv_620_10)
 		h.ptr = 0
 	}
 }
@@ -115647,7 +115748,7 @@ func (h *ErrorSource) UnsafeArenaSetAllocatedErrorLocation(value *Googlesql_Erro
 func (h *ErrorSource) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(622, 28, buf, wasm2go.Inv_622_28)
+		module().enqueueFree(622, 28, buf, wasm2go.Inv_622_28)
 		h.ptr = 0
 	}
 }
@@ -115828,7 +115929,7 @@ func NewEvaluatorTableIteratorFromImpl(impl EvaluatorTableIteratorCallback) (*Ev
 func (h *EvaluatorTableIterator) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(623, 10, buf, wasm2go.Inv_623_10)
+		module().enqueueFree(623, 10, buf, wasm2go.Inv_623_10)
 		h.ptr = 0
 	}
 }
@@ -115996,7 +116097,7 @@ func (h *ExecutionStats) SetStackPeakUsedBytes(value uint64) error {
 func (h *ExecutionStats) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(624, 18, buf, wasm2go.Inv_624_18)
+		module().enqueueFree(624, 18, buf, wasm2go.Inv_624_18)
 		h.ptr = 0
 	}
 }
@@ -116201,7 +116302,7 @@ func (h *ExpressionAttributeProto) SetRowIdentityColumnIndex(index int32, value 
 func (h *ExpressionAttributeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(625, 22, buf, wasm2go.Inv_625_22)
+		module().enqueueFree(625, 22, buf, wasm2go.Inv_625_22)
 		h.ptr = 0
 	}
 }
@@ -116271,7 +116372,7 @@ func (h *ExtendedType) TypeNameWithModifiers(typeModifiers *TypeModifiers, mode 
 func (h *ExtendedType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(626, 4, buf, wasm2go.Inv_626_4)
+		module().enqueueFree(626, 4, buf, wasm2go.Inv_626_4)
 		h.ptr = 0
 	}
 }
@@ -116338,7 +116439,7 @@ func (h *ExtendedTypeDeserializer) Deserialize(typeProto *TypeProto, typeDeseria
 func (h *ExtendedTypeDeserializer) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(627, 1, buf, wasm2go.Inv_627_1)
+		module().enqueueFree(627, 1, buf, wasm2go.Inv_627_1)
 		h.ptr = 0
 	}
 }
@@ -116444,7 +116545,7 @@ func (h *ExtendedTypeParameters) Parameter(i int32) (*SimpleValue, error) {
 func (h *ExtendedTypeParameters) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(628, 6, buf, wasm2go.Inv_628_6)
+		module().enqueueFree(628, 6, buf, wasm2go.Inv_628_6)
 		h.ptr = 0
 	}
 }
@@ -116579,7 +116680,7 @@ func (h *ExtendedTypeParametersProto) ParametersSize() (int32, error) {
 func (h *ExtendedTypeParametersProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(629, 13, buf, wasm2go.Inv_629_13)
+		module().enqueueFree(629, 13, buf, wasm2go.Inv_629_13)
 		h.ptr = 0
 	}
 }
@@ -116623,7 +116724,7 @@ func (h *FakeASTNode) Name() (string, error) {
 func (h *FakeASTNode) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(630, 2, buf, wasm2go.Inv_630_2)
+		module().enqueueFree(630, 2, buf, wasm2go.Inv_630_2)
 		h.ptr = 0
 	}
 }
@@ -117074,7 +117175,7 @@ func (h *FieldDescriptor) TypeName() (string, error) {
 func (h *FieldDescriptor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(5, 37, buf, wasm2go.Inv_5_37)
+		module().enqueueFree(5, 37, buf, wasm2go.Inv_5_37)
 		h.ptr = 0
 	}
 }
@@ -117254,7 +117355,7 @@ func (h *FieldDescriptorRefProto) UnsafeArenaSetAllocatedContainingProto(value *
 func (h *FieldDescriptorRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(631, 19, buf, wasm2go.Inv_631_19)
+		module().enqueueFree(631, 19, buf, wasm2go.Inv_631_19)
 		h.ptr = 0
 	}
 }
@@ -117608,7 +117709,7 @@ func (h *FileDescriptor) WeakDependencyCount() (int32, error) {
 func (h *FileDescriptor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(6, 26, buf, wasm2go.Inv_6_26)
+		module().enqueueFree(6, 26, buf, wasm2go.Inv_6_26)
 		h.ptr = 0
 	}
 }
@@ -118073,7 +118174,7 @@ func (h *FileDescriptorProto) WeakDependencySize() (int32, error) {
 func (h *FileDescriptorProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(7, 53, buf, wasm2go.Inv_7_53)
+		module().enqueueFree(7, 53, buf, wasm2go.Inv_7_53)
 		h.ptr = 0
 	}
 }
@@ -118208,7 +118309,7 @@ func (h *FileDescriptorSet) MutableFile(index int32) (*FileDescriptorProto, erro
 func (h *FileDescriptorSet) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(8, 13, buf, wasm2go.Inv_8_13)
+		module().enqueueFree(8, 13, buf, wasm2go.Inv_8_13)
 		h.ptr = 0
 	}
 }
@@ -118357,7 +118458,7 @@ func (h *FixedOutputSchemaTVF) ResultSchema() (*TVFRelation, error) {
 func (h *FixedOutputSchemaTVF) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(632, 5, buf, wasm2go.Inv_632_5)
+		module().enqueueFree(632, 5, buf, wasm2go.Inv_632_5)
 		h.ptr = 0
 	}
 }
@@ -118475,7 +118576,7 @@ func (h *FloatMargin) IsExactEquality() (bool, error) {
 func (h *FloatMargin) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(633, 5, buf, wasm2go.Inv_633_5)
+		module().enqueueFree(633, 5, buf, wasm2go.Inv_633_5)
 		h.ptr = 0
 	}
 }
@@ -118582,7 +118683,7 @@ func (h *ForwardInputSchemaToOutputSchemaTVF) Resolve(analyzerOptions *AnalyzerO
 func (h *ForwardInputSchemaToOutputSchemaTVF) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(634, 3, buf, wasm2go.Inv_634_3)
+		module().enqueueFree(634, 3, buf, wasm2go.Inv_634_3)
 		h.ptr = 0
 	}
 }
@@ -118910,7 +119011,7 @@ func (h *FreestandingDeprecationWarning) UnsafeArenaSetAllocatedErrorLocation(va
 func (h *FreestandingDeprecationWarning) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(635, 36, buf, wasm2go.Inv_635_36)
+		module().enqueueFree(635, 36, buf, wasm2go.Inv_635_36)
 		h.ptr = 0
 	}
 }
@@ -119716,7 +119817,7 @@ func (h *Function) StatementContext() (StatementContext, error) {
 func (h *Function) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(636, 55, buf, wasm2go.Inv_636_55)
+		module().enqueueFree(636, 55, buf, wasm2go.Inv_636_55)
 		h.ptr = 0
 	}
 }
@@ -120372,7 +120473,7 @@ func (h *FunctionArgumentType) Type() (Googlesql_TypeNode, error) {
 func (h *FunctionArgumentType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(637, 52, buf, wasm2go.Inv_637_52)
+		module().enqueueFree(637, 52, buf, wasm2go.Inv_637_52)
 		h.ptr = 0
 	}
 }
@@ -120949,7 +121050,7 @@ func (h *FunctionArgumentTypeOptions) UsesArrayElementForCollation() (bool, erro
 func (h *FunctionArgumentTypeOptions) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(638, 50, buf, wasm2go.Inv_638_50)
+		module().enqueueFree(638, 50, buf, wasm2go.Inv_638_50)
 		h.ptr = 0
 	}
 }
@@ -122103,7 +122204,7 @@ func (h *FunctionArgumentTypeOptionsProto) UsesArrayElementForCollation() (bool,
 func (h *FunctionArgumentTypeOptionsProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(639, 139, buf, wasm2go.Inv_639_139)
+		module().enqueueFree(639, 139, buf, wasm2go.Inv_639_139)
 		h.ptr = 0
 	}
 }
@@ -122449,7 +122550,7 @@ func (h *FunctionArgumentTypeProto) UnsafeArenaSetAllocatedType(value *TypeProto
 func (h *FunctionArgumentTypeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(640, 39, buf, wasm2go.Inv_640_39)
+		module().enqueueFree(640, 39, buf, wasm2go.Inv_640_39)
 		h.ptr = 0
 	}
 }
@@ -123209,7 +123310,7 @@ func (h *FunctionOptionsProto) WindowOrderingSupport() (FunctionEnums_WindowOrde
 func (h *FunctionOptionsProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(641, 90, buf, wasm2go.Inv_641_90)
+		module().enqueueFree(641, 90, buf, wasm2go.Inv_641_90)
 		h.ptr = 0
 	}
 }
@@ -123716,7 +123817,7 @@ func (h *FunctionProto) UnsafeArenaSetAllocatedParseResumeLocation(value *ParseR
 func (h *FunctionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(642, 57, buf, wasm2go.Inv_642_57)
+		module().enqueueFree(642, 57, buf, wasm2go.Inv_642_57)
 		h.ptr = 0
 	}
 }
@@ -123858,7 +123959,7 @@ func (h *FunctionRefProto) SetAllocatedName() (string, error) {
 func (h *FunctionRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(643, 14, buf, wasm2go.Inv_643_14)
+		module().enqueueFree(643, 14, buf, wasm2go.Inv_643_14)
 		h.ptr = 0
 	}
 }
@@ -124543,7 +124644,7 @@ func (h *FunctionSignature) ResultType() (*FunctionArgumentType, error) {
 func (h *FunctionSignature) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(644, 46, buf, wasm2go.Inv_644_46)
+		module().enqueueFree(644, 46, buf, wasm2go.Inv_644_46)
 		h.ptr = 0
 	}
 }
@@ -124606,7 +124707,7 @@ func (h *FunctionSignatureOnHeap) Get() (*FunctionSignature, error) {
 func (h *FunctionSignatureOnHeap) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(645, 2, buf, wasm2go.Inv_645_2)
+		module().enqueueFree(645, 2, buf, wasm2go.Inv_645_2)
 		h.ptr = 0
 	}
 }
@@ -124918,7 +125019,7 @@ func (h *FunctionSignatureOptions) UsesOperationCollation() (bool, error) {
 func (h *FunctionSignatureOptions) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(646, 22, buf, wasm2go.Inv_646_22)
+		module().enqueueFree(646, 22, buf, wasm2go.Inv_646_22)
 		h.ptr = 0
 	}
 }
@@ -125321,7 +125422,7 @@ func (h *FunctionSignatureOptionsProto) UsesOperationCollation() (bool, error) {
 func (h *FunctionSignatureOptionsProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(647, 46, buf, wasm2go.Inv_647_46)
+		module().enqueueFree(647, 46, buf, wasm2go.Inv_647_46)
 		h.ptr = 0
 	}
 }
@@ -125613,7 +125714,7 @@ func (h *FunctionSignatureProto) UnsafeArenaSetAllocatedReturnType(value *Functi
 func (h *FunctionSignatureProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(648, 32, buf, wasm2go.Inv_648_32)
+		module().enqueueFree(648, 32, buf, wasm2go.Inv_648_32)
 		h.ptr = 0
 	}
 }
@@ -125895,7 +125996,7 @@ func (h *FunctionSignatureRewriteOptions) Sql() (string, error) {
 func (h *FunctionSignatureRewriteOptions) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(649, 12, buf, wasm2go.Inv_649_12)
+		module().enqueueFree(649, 12, buf, wasm2go.Inv_649_12)
 		h.ptr = 0
 	}
 }
@@ -126178,7 +126279,7 @@ func (h *FunctionSignatureRewriteOptionsProto) Sql() (string, error) {
 func (h *FunctionSignatureRewriteOptionsProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(650, 31, buf, wasm2go.Inv_650_31)
+		module().enqueueFree(650, 31, buf, wasm2go.Inv_650_31)
 		h.ptr = 0
 	}
 }
@@ -126462,7 +126563,7 @@ func (h *GoogleSQLBuiltinFunctionOptionsProto) UnsafeArenaSetAllocatedLanguageOp
 func (h *GoogleSQLBuiltinFunctionOptionsProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(651, 31, buf, wasm2go.Inv_651_31)
+		module().enqueueFree(651, 31, buf, wasm2go.Inv_651_31)
 		h.ptr = 0
 	}
 }
@@ -126635,7 +126736,7 @@ func NewGooglesql_ColumnFromImpl(impl Googlesql_ColumnCallback) (*Googlesql_Colu
 func (h *Googlesql_Column) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(601, 11, buf, wasm2go.Inv_601_11)
+		module().enqueueFree(601, 11, buf, wasm2go.Inv_601_11)
 		h.ptr = 0
 	}
 }
@@ -126914,7 +127015,7 @@ func (h *Googlesql_ErrorLocation) SetLine(value int32) error {
 func (h *Googlesql_ErrorLocation) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(621, 31, buf, wasm2go.Inv_621_31)
+		module().enqueueFree(621, 31, buf, wasm2go.Inv_621_31)
 		h.ptr = 0
 	}
 }
@@ -128136,7 +128237,7 @@ func (h *GraphDynamicLabel) LabelExpression() (string, error) {
 func (h *GraphDynamicLabel) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(652, 2, buf, wasm2go.Inv_652_2)
+		module().enqueueFree(652, 2, buf, wasm2go.Inv_652_2)
 		h.ptr = 0
 	}
 }
@@ -128200,7 +128301,7 @@ func (h *GraphDynamicProperties) PropertiesExpression() (string, error) {
 func (h *GraphDynamicProperties) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(653, 2, buf, wasm2go.Inv_653_2)
+		module().enqueueFree(653, 2, buf, wasm2go.Inv_653_2)
 		h.ptr = 0
 	}
 }
@@ -128283,7 +128384,7 @@ func NewGraphEdgeTableFromImpl(impl GraphEdgeTableCallback) (*GraphEdgeTable, er
 func (h *GraphEdgeTable) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(654, 5, buf, wasm2go.Inv_654_5)
+		module().enqueueFree(654, 5, buf, wasm2go.Inv_654_5)
 		h.ptr = 0
 	}
 }
@@ -128396,7 +128497,7 @@ func NewGraphElementLabelFromImpl(impl GraphElementLabelCallback) (*GraphElement
 func (h *GraphElementLabel) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(655, 5, buf, wasm2go.Inv_655_5)
+		module().enqueueFree(655, 5, buf, wasm2go.Inv_655_5)
 		h.ptr = 0
 	}
 }
@@ -128605,7 +128706,7 @@ func (h *GraphElementLabelRefProto) UnsafeArenaSetAllocatedPropertyGraph(value *
 func (h *GraphElementLabelRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(656, 22, buf, wasm2go.Inv_656_22)
+		module().enqueueFree(656, 22, buf, wasm2go.Inv_656_22)
 		h.ptr = 0
 	}
 }
@@ -128872,7 +128973,7 @@ func NewGraphElementTableFromImpl(impl GraphElementTableCallback) (*GraphElement
 func (h *GraphElementTable) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(657, 17, buf, wasm2go.Inv_657_17)
+		module().enqueueFree(657, 17, buf, wasm2go.Inv_657_17)
 		h.ptr = 0
 	}
 }
@@ -129081,7 +129182,7 @@ func (h *GraphElementTableRefProto) UnsafeArenaSetAllocatedPropertyGraph(value *
 func (h *GraphElementTableRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(658, 22, buf, wasm2go.Inv_658_22)
+		module().enqueueFree(658, 22, buf, wasm2go.Inv_658_22)
 		h.ptr = 0
 	}
 }
@@ -129402,7 +129503,7 @@ func (h *GraphElementType) PropertyTypes() ([]*PropertyType, error) {
 func (h *GraphElementType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(659, 23, buf, wasm2go.Inv_659_23)
+		module().enqueueFree(659, 23, buf, wasm2go.Inv_659_23)
 		h.ptr = 0
 	}
 }
@@ -129646,7 +129747,7 @@ func (h *GraphElementTypeProto) SetKind(value GraphElementTypeProto_ElementKind)
 func (h *GraphElementTypeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(660, 26, buf, wasm2go.Inv_660_26)
+		module().enqueueFree(660, 26, buf, wasm2go.Inv_660_26)
 		h.ptr = 0
 	}
 }
@@ -129855,7 +129956,7 @@ func (h *GraphElementTypeProto_PropertyTypeProto) ValueType() (*TypeProto, error
 func (h *GraphElementTypeProto_PropertyTypeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(661, 22, buf, wasm2go.Inv_661_22)
+		module().enqueueFree(661, 22, buf, wasm2go.Inv_661_22)
 		h.ptr = 0
 	}
 }
@@ -129918,7 +130019,7 @@ func NewGraphNodeTableFromImpl(impl GraphNodeTableCallback) (*GraphNodeTable, er
 func (h *GraphNodeTable) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(662, 3, buf, wasm2go.Inv_662_3)
+		module().enqueueFree(662, 3, buf, wasm2go.Inv_662_3)
 		h.ptr = 0
 	}
 }
@@ -130040,7 +130141,7 @@ func NewGraphNodeTableReferenceFromImpl(impl GraphNodeTableReferenceCallback) (*
 func (h *GraphNodeTableReference) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(663, 4, buf, wasm2go.Inv_663_4)
+		module().enqueueFree(663, 4, buf, wasm2go.Inv_663_4)
 		h.ptr = 0
 	}
 }
@@ -130260,7 +130361,7 @@ func (h *GraphPathType) NodeType() (*GraphElementType, error) {
 func (h *GraphPathType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(664, 17, buf, wasm2go.Inv_664_17)
+		module().enqueueFree(664, 17, buf, wasm2go.Inv_664_17)
 		h.ptr = 0
 	}
 }
@@ -130484,7 +130585,7 @@ func (h *GraphPathTypeProto) UnsafeArenaSetAllocatedNodeType(value *GraphElement
 func (h *GraphPathTypeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(665, 24, buf, wasm2go.Inv_665_24)
+		module().enqueueFree(665, 24, buf, wasm2go.Inv_665_24)
 		h.ptr = 0
 	}
 }
@@ -130635,7 +130736,7 @@ func NewGraphPropertyDeclarationFromImpl(impl GraphPropertyDeclarationCallback) 
 func (h *GraphPropertyDeclaration) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(666, 8, buf, wasm2go.Inv_666_8)
+		module().enqueueFree(666, 8, buf, wasm2go.Inv_666_8)
 		h.ptr = 0
 	}
 }
@@ -130844,7 +130945,7 @@ func (h *GraphPropertyDeclarationRefProto) UnsafeArenaSetAllocatedPropertyGraph(
 func (h *GraphPropertyDeclarationRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(667, 22, buf, wasm2go.Inv_667_22)
+		module().enqueueFree(667, 22, buf, wasm2go.Inv_667_22)
 		h.ptr = 0
 	}
 }
@@ -130918,7 +131019,7 @@ func (h *GraphPropertyDefinition) ExpressionSql() (string, error) {
 func (h *GraphPropertyDefinition) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(668, 3, buf, wasm2go.Inv_668_3)
+		module().enqueueFree(668, 3, buf, wasm2go.Inv_668_3)
 		h.ptr = 0
 	}
 }
@@ -131054,7 +131155,7 @@ func (h *GroupingSetRewriteOptions) SetMaxGroupingSets(value int64) error {
 func (h *GroupingSetRewriteOptions) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(669, 14, buf, wasm2go.Inv_669_14)
+		module().enqueueFree(669, 14, buf, wasm2go.Inv_669_14)
 		h.ptr = 0
 	}
 }
@@ -131313,7 +131414,7 @@ func (h *IdString) Substr(start uint64, count uint64) (string, error) {
 func (h *IdString) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(670, 19, buf, wasm2go.Inv_670_19)
+		module().enqueueFree(670, 19, buf, wasm2go.Inv_670_19)
 		h.ptr = 0
 	}
 }
@@ -131398,7 +131499,7 @@ func (h *IdStringPool) Make(str string) (*IdString, error) {
 func (h *IdStringPool) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(671, 3, buf, wasm2go.Inv_671_3)
+		module().enqueueFree(671, 3, buf, wasm2go.Inv_671_3)
 		h.ptr = 0
 	}
 }
@@ -132051,7 +132152,7 @@ func (h *InputArgumentType) Type() (Googlesql_TypeNode, error) {
 func (h *InputArgumentType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(672, 49, buf, wasm2go.Inv_672_49)
+		module().enqueueFree(672, 49, buf, wasm2go.Inv_672_49)
 		h.ptr = 0
 	}
 }
@@ -132261,7 +132362,7 @@ func (h *InternalErrorLocation) SetByteOffset(value int32) error {
 func (h *InternalErrorLocation) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(673, 22, buf, wasm2go.Inv_673_22)
+		module().enqueueFree(673, 22, buf, wasm2go.Inv_673_22)
 		h.ptr = 0
 	}
 }
@@ -132492,7 +132593,7 @@ func (h *IntervalValue) GetNanoFractions() (int64, error) {
 func (h *IntervalValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(674, 18, buf, wasm2go.Inv_674_18)
+		module().enqueueFree(674, 18, buf, wasm2go.Inv_674_18)
 		h.ptr = 0
 	}
 }
@@ -132654,7 +132755,7 @@ func (h *JSONValue) GetRef() (*JSONValueRef, error) {
 func (h *JSONValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(675, 10, buf, wasm2go.Inv_675_10)
+		module().enqueueFree(675, 10, buf, wasm2go.Inv_675_10)
 		h.ptr = 0
 	}
 }
@@ -133023,7 +133124,7 @@ func (h *JSONValueConstRef) ToString() (string, error) {
 func (h *JSONValueConstRef) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(676, 28, buf, wasm2go.Inv_676_28)
+		module().enqueueFree(676, 28, buf, wasm2go.Inv_676_28)
 		h.ptr = 0
 	}
 }
@@ -133266,7 +133367,7 @@ func (h *JSONValueRef) SetUInt64(value uint64) error {
 func (h *JSONValueRef) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(677, 18, buf, wasm2go.Inv_677_18)
+		module().enqueueFree(677, 18, buf, wasm2go.Inv_677_18)
 		h.ptr = 0
 	}
 }
@@ -133615,7 +133716,7 @@ func (h *LanguageOptions) SetProductMode(mode ProductMode) error {
 func (h *LanguageOptions) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(678, 29, buf, wasm2go.Inv_678_29)
+		module().enqueueFree(678, 29, buf, wasm2go.Inv_678_29)
 		h.ptr = 0
 	}
 }
@@ -134018,7 +134119,7 @@ func (h *LanguageOptionsProto) SupportedStatementKindsSize() (int32, error) {
 func (h *LanguageOptionsProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(679, 45, buf, wasm2go.Inv_679_45)
+		module().enqueueFree(679, 45, buf, wasm2go.Inv_679_45)
 		h.ptr = 0
 	}
 }
@@ -134048,7 +134149,7 @@ func newListBackedTypeNoFinalizer(ptr uint64) *ListBackedType {
 func (h *ListBackedType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(680, 0, buf, wasm2go.Inv_680_0)
+		module().enqueueFree(680, 0, buf, wasm2go.Inv_680_0)
 		h.ptr = 0
 	}
 }
@@ -134475,7 +134576,7 @@ func (h *MapTypeProto) ValueType() (*TypeProto, error) {
 func (h *MapTypeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(682, 24, buf, wasm2go.Inv_682_24)
+		module().enqueueFree(682, 24, buf, wasm2go.Inv_682_24)
 		h.ptr = 0
 	}
 }
@@ -134671,7 +134772,7 @@ func (h *MeasureType) ResultType() (Googlesql_TypeNode, error) {
 func (h *MeasureType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(683, 15, buf, wasm2go.Inv_683_15)
+		module().enqueueFree(683, 15, buf, wasm2go.Inv_683_15)
 		h.ptr = 0
 	}
 }
@@ -134828,7 +134929,7 @@ func (h *MeasureTypeProto) UnsafeArenaSetAllocatedResultType(value *TypeProto) e
 func (h *MeasureTypeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(684, 16, buf, wasm2go.Inv_684_16)
+		module().enqueueFree(684, 16, buf, wasm2go.Inv_684_16)
 		h.ptr = 0
 	}
 }
@@ -135046,7 +135147,7 @@ func (h *Message) Utf8DebugString() (string, error) {
 func (h *Message) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(9, 16, buf, wasm2go.Inv_9_16)
+		module().enqueueFree(9, 16, buf, wasm2go.Inv_9_16)
 		h.ptr = 0
 	}
 }
@@ -135388,7 +135489,7 @@ func (h *MessageLite) Utf8DebugString() (string, error) {
 func (h *MessageLite) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(10, 25, buf, wasm2go.Inv_10_25)
+		module().enqueueFree(10, 25, buf, wasm2go.Inv_10_25)
 		h.ptr = 0
 	}
 }
@@ -135540,7 +135641,7 @@ func NewModelFromImpl(impl ModelCallback) (*Model, error) {
 func (h *Model) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(685, 10, buf, wasm2go.Inv_685_10)
+		module().enqueueFree(685, 10, buf, wasm2go.Inv_685_10)
 		h.ptr = 0
 	}
 }
@@ -135757,7 +135858,7 @@ func (h *ModelRefProto) SetSerializationId(value int64) error {
 func (h *ModelRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(686, 23, buf, wasm2go.Inv_686_23)
+		module().enqueueFree(686, 23, buf, wasm2go.Inv_686_23)
 		h.ptr = 0
 	}
 }
@@ -135954,7 +136055,7 @@ func (h *MultiCatalog) Catalogs() ([]CatalogNode, error) {
 func (h *MultiCatalog) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(687, 13, buf, wasm2go.Inv_687_13)
+		module().enqueueFree(687, 13, buf, wasm2go.Inv_687_13)
 		h.ptr = 0
 	}
 }
@@ -135994,7 +136095,7 @@ func newNonRecursiveParseTreeVisitorNoFinalizer(ptr uint64) *NonRecursiveParseTr
 func (h *NonRecursiveParseTreeVisitor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(688, 0, buf, wasm2go.Inv_688_0)
+		module().enqueueFree(688, 0, buf, wasm2go.Inv_688_0)
 		h.ptr = 0
 	}
 }
@@ -136177,7 +136278,7 @@ func (h *NumericTypeParametersProto) SetScale(value int64) error {
 func (h *NumericTypeParametersProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(689, 20, buf, wasm2go.Inv_689_20)
+		module().enqueueFree(689, 20, buf, wasm2go.Inv_689_20)
 		h.ptr = 0
 	}
 }
@@ -136688,7 +136789,7 @@ func (h *NumericValue) LowBits() (uint64, error) {
 func (h *NumericValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(690, 40, buf, wasm2go.Inv_690_40)
+		module().enqueueFree(690, 40, buf, wasm2go.Inv_690_40)
 		h.ptr = 0
 	}
 }
@@ -136789,7 +136890,7 @@ func (h *OneofDescriptor) Index() (int32, error) {
 func (h *OneofDescriptor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(11, 6, buf, wasm2go.Inv_11_6)
+		module().enqueueFree(11, 6, buf, wasm2go.Inv_11_6)
 		h.ptr = 0
 	}
 }
@@ -136969,7 +137070,7 @@ func (h *OneofDescriptorRefProto) UnsafeArenaSetAllocatedContainingProto(value *
 func (h *OneofDescriptorRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(691, 19, buf, wasm2go.Inv_691_19)
+		module().enqueueFree(691, 19, buf, wasm2go.Inv_691_19)
 		h.ptr = 0
 	}
 }
@@ -137139,7 +137240,7 @@ func (h *ParseLocationPoint) Filename() (string, error) {
 func (h *ParseLocationPoint) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(692, 11, buf, wasm2go.Inv_692_11)
+		module().enqueueFree(692, 11, buf, wasm2go.Inv_692_11)
 		h.ptr = 0
 	}
 }
@@ -137326,7 +137427,7 @@ func (h *ParseLocationRange) Start() (*ParseLocationPoint, error) {
 func (h *ParseLocationRange) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(693, 14, buf, wasm2go.Inv_693_14)
+		module().enqueueFree(693, 14, buf, wasm2go.Inv_693_14)
 		h.ptr = 0
 	}
 }
@@ -137514,7 +137615,7 @@ func (h *ParseLocationRangeProto) SetStart(value int32) error {
 func (h *ParseLocationRangeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(694, 20, buf, wasm2go.Inv_694_20)
+		module().enqueueFree(694, 20, buf, wasm2go.Inv_694_20)
 		h.ptr = 0
 	}
 }
@@ -137706,7 +137807,7 @@ func (h *ParseResumeLocation) SetBytePosition(bytePosition int32) error {
 func (h *ParseResumeLocation) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(695, 14, buf, wasm2go.Inv_695_14)
+		module().enqueueFree(695, 14, buf, wasm2go.Inv_695_14)
 		h.ptr = 0
 	}
 }
@@ -137955,7 +138056,7 @@ func (h *ParseResumeLocationProto) SetBytePosition(value int32) error {
 func (h *ParseResumeLocationProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(696, 27, buf, wasm2go.Inv_696_27)
+		module().enqueueFree(696, 27, buf, wasm2go.Inv_696_27)
 		h.ptr = 0
 	}
 }
@@ -138011,7 +138112,7 @@ func NewParseTreeStatusVisitorFromImpl(impl ParseTreeStatusVisitorCallback) (*Pa
 func (h *ParseTreeStatusVisitor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(697, 1, buf, wasm2go.Inv_697_1)
+		module().enqueueFree(697, 1, buf, wasm2go.Inv_697_1)
 		h.ptr = 0
 	}
 }
@@ -138067,7 +138168,7 @@ func NewParseTreeVisitorFromImpl(impl ParseTreeVisitorCallback) (*ParseTreeVisit
 func (h *ParseTreeVisitor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(698, 1, buf, wasm2go.Inv_698_1)
+		module().enqueueFree(698, 1, buf, wasm2go.Inv_698_1)
 		h.ptr = 0
 	}
 }
@@ -138255,7 +138356,7 @@ func (h *ParserOptions) SetLanguageOptions(languageOptions *LanguageOptions) err
 func (h *ParserOptions) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(699, 12, buf, wasm2go.Inv_699_12)
+		module().enqueueFree(699, 12, buf, wasm2go.Inv_699_12)
 		h.ptr = 0
 	}
 }
@@ -138380,7 +138481,7 @@ func (h *ParserOutput) Warnings() error {
 func (h *ParserOutput) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(700, 9, buf, wasm2go.Inv_700_9)
+		module().enqueueFree(700, 9, buf, wasm2go.Inv_700_9)
 		h.ptr = 0
 	}
 }
@@ -138460,7 +138561,7 @@ func (h *ParserRuntimeInfo) NumLexicalTokens() (int64, error) {
 func (h *ParserRuntimeInfo) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(701, 5, buf, wasm2go.Inv_701_5)
+		module().enqueueFree(701, 5, buf, wasm2go.Inv_701_5)
 		h.ptr = 0
 	}
 }
@@ -138598,7 +138699,7 @@ func (h *PicoTime) ToString(timezone *TimeZone) (string, error) {
 func (h *PicoTime) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(702, 8, buf, wasm2go.Inv_702_8)
+		module().enqueueFree(702, 8, buf, wasm2go.Inv_702_8)
 		h.ptr = 0
 	}
 }
@@ -138728,7 +138829,7 @@ func (h *Procedure) Signature() (*FunctionSignature, error) {
 func (h *Procedure) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(703, 6, buf, wasm2go.Inv_703_6)
+		module().enqueueFree(703, 6, buf, wasm2go.Inv_703_6)
 		h.ptr = 0
 	}
 }
@@ -138930,7 +139031,7 @@ func (h *ProcedureProto) UnsafeArenaSetAllocatedSignature(value *FunctionSignatu
 func (h *ProcedureProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(704, 21, buf, wasm2go.Inv_704_21)
+		module().enqueueFree(704, 21, buf, wasm2go.Inv_704_21)
 		h.ptr = 0
 	}
 }
@@ -139072,7 +139173,7 @@ func (h *ProcedureRefProto) SetAllocatedName() (string, error) {
 func (h *ProcedureRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(705, 14, buf, wasm2go.Inv_705_14)
+		module().enqueueFree(705, 14, buf, wasm2go.Inv_705_14)
 		h.ptr = 0
 	}
 }
@@ -139270,7 +139371,7 @@ func NewPropertyGraphFromImpl(impl PropertyGraphCallback) (*PropertyGraph, error
 func (h *PropertyGraph) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(706, 11, buf, wasm2go.Inv_706_11)
+		module().enqueueFree(706, 11, buf, wasm2go.Inv_706_11)
 		h.ptr = 0
 	}
 }
@@ -139412,7 +139513,7 @@ func (h *PropertyGraphRefProto) SetAllocatedFullName() (string, error) {
 func (h *PropertyGraphRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(707, 14, buf, wasm2go.Inv_707_14)
+		module().enqueueFree(707, 14, buf, wasm2go.Inv_707_14)
 		h.ptr = 0
 	}
 }
@@ -139954,7 +140055,7 @@ func (h *ProtoTypeProto) SetFileDescriptorSetIndex(value int32) error {
 func (h *ProtoTypeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(709, 28, buf, wasm2go.Inv_709_28)
+		module().enqueueFree(709, 28, buf, wasm2go.Inv_709_28)
 		h.ptr = 0
 	}
 }
@@ -140260,7 +140361,7 @@ func (h *RangeTypeProto) UnsafeArenaSetAllocatedElementType(value *TypeProto) er
 func (h *RangeTypeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(711, 16, buf, wasm2go.Inv_711_16)
+		module().enqueueFree(711, 16, buf, wasm2go.Inv_711_16)
 		h.ptr = 0
 	}
 }
@@ -140538,7 +140639,7 @@ func (h *Reflection_Column) Type() (string, error) {
 func (h *Reflection_Column) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1444, 30, buf, wasm2go.Inv_1444_30)
+		module().enqueueFree(1444, 30, buf, wasm2go.Inv_1444_30)
 		h.ptr = 0
 	}
 }
@@ -142757,7 +142858,7 @@ func (h *ResolvedASTVisitor) VisitResolvedWithScan(node *ResolvedWithScan) error
 func (h *ResolvedASTVisitor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(712, 310, buf, wasm2go.Inv_712_310)
+		module().enqueueFree(712, 310, buf, wasm2go.Inv_712_310)
 		h.ptr = 0
 	}
 }
@@ -142817,7 +142918,7 @@ func (h *ResolvedAbortBatchStmt) NodeKindString() (string, error) {
 func (h *ResolvedAbortBatchStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(713, 4, buf, wasm2go.Inv_713_4)
+		module().enqueueFree(713, 4, buf, wasm2go.Inv_713_4)
 		h.ptr = 0
 	}
 }
@@ -142945,7 +143046,7 @@ func (h *ResolvedAbortBatchStmtProto) UnsafeArenaSetAllocatedParent(value *Resol
 func (h *ResolvedAbortBatchStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(714, 12, buf, wasm2go.Inv_714_12)
+		module().enqueueFree(714, 12, buf, wasm2go.Inv_714_12)
 		h.ptr = 0
 	}
 }
@@ -143130,7 +143231,7 @@ func (h *ResolvedAddColumnAction) SetIsIfNotExists(v bool) error {
 func (h *ResolvedAddColumnAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(715, 15, buf, wasm2go.Inv_715_15)
+		module().enqueueFree(715, 15, buf, wasm2go.Inv_715_15)
 		h.ptr = 0
 	}
 }
@@ -143357,7 +143458,7 @@ func (h *ResolvedAddColumnActionProto) UnsafeArenaSetAllocatedParent(value *Reso
 func (h *ResolvedAddColumnActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(716, 24, buf, wasm2go.Inv_716_24)
+		module().enqueueFree(716, 24, buf, wasm2go.Inv_716_24)
 		h.ptr = 0
 	}
 }
@@ -143625,7 +143726,7 @@ func (h *ResolvedAddColumnIdentifierAction) SetOptionsList(v []*ResolvedOption) 
 func (h *ResolvedAddColumnIdentifierAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(717, 20, buf, wasm2go.Inv_717_20)
+		module().enqueueFree(717, 20, buf, wasm2go.Inv_717_20)
 		h.ptr = 0
 	}
 }
@@ -143882,7 +143983,7 @@ func (h *ResolvedAddColumnIdentifierActionProto) UnsafeArenaSetAllocatedParent(v
 func (h *ResolvedAddColumnIdentifierActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(718, 27, buf, wasm2go.Inv_718_27)
+		module().enqueueFree(718, 27, buf, wasm2go.Inv_718_27)
 		h.ptr = 0
 	}
 }
@@ -144084,7 +144185,7 @@ func (h *ResolvedAddConstraintAction) Table() (TableNode, error) {
 func (h *ResolvedAddConstraintAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(719, 17, buf, wasm2go.Inv_719_17)
+		module().enqueueFree(719, 17, buf, wasm2go.Inv_719_17)
 		h.ptr = 0
 	}
 }
@@ -144378,7 +144479,7 @@ func (h *ResolvedAddConstraintActionProto) UnsafeArenaSetAllocatedTable(value *T
 func (h *ResolvedAddConstraintActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(720, 32, buf, wasm2go.Inv_720_32)
+		module().enqueueFree(720, 32, buf, wasm2go.Inv_720_32)
 		h.ptr = 0
 	}
 }
@@ -144680,7 +144781,7 @@ func (h *ResolvedAddSubEntityAction) SetOptionsList(v []*ResolvedOption) error {
 func (h *ResolvedAddSubEntityAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(721, 22, buf, wasm2go.Inv_721_22)
+		module().enqueueFree(721, 22, buf, wasm2go.Inv_721_22)
 		h.ptr = 0
 	}
 }
@@ -144989,7 +145090,7 @@ func (h *ResolvedAddSubEntityActionProto) UnsafeArenaSetAllocatedParent(value *R
 func (h *ResolvedAddSubEntityActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(722, 33, buf, wasm2go.Inv_722_33)
+		module().enqueueFree(722, 33, buf, wasm2go.Inv_722_33)
 		h.ptr = 0
 	}
 }
@@ -145255,7 +145356,7 @@ func (h *ResolvedAddToRestricteeListAction) SetRestricteeList(v []ResolvedExprNo
 func (h *ResolvedAddToRestricteeListAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(723, 18, buf, wasm2go.Inv_723_18)
+		module().enqueueFree(723, 18, buf, wasm2go.Inv_723_18)
 		h.ptr = 0
 	}
 }
@@ -145460,7 +145561,7 @@ func (h *ResolvedAddToRestricteeListActionProto) UnsafeArenaSetAllocatedParent(v
 func (h *ResolvedAddToRestricteeListActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(724, 21, buf, wasm2go.Inv_724_21)
+		module().enqueueFree(724, 21, buf, wasm2go.Inv_724_21)
 		h.ptr = 0
 	}
 }
@@ -146120,7 +146221,7 @@ func (h *ResolvedAggregateFunctionCall) SetOrderByItemList(v []*ResolvedOrderByI
 func (h *ResolvedAggregateFunctionCall) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(725, 45, buf, wasm2go.Inv_725_45)
+		module().enqueueFree(725, 45, buf, wasm2go.Inv_725_45)
 		h.ptr = 0
 	}
 }
@@ -146696,7 +146797,7 @@ func (h *ResolvedAggregateFunctionCallProto) UnsafeArenaSetAllocatedParent(value
 func (h *ResolvedAggregateFunctionCallProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(726, 64, buf, wasm2go.Inv_726_64)
+		module().enqueueFree(726, 64, buf, wasm2go.Inv_726_64)
 		h.ptr = 0
 	}
 }
@@ -146899,7 +147000,7 @@ func (h *ResolvedAggregateHavingModifier) SetKind(v ResolvedAggregateHavingModif
 func (h *ResolvedAggregateHavingModifier) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(727, 16, buf, wasm2go.Inv_727_16)
+		module().enqueueFree(727, 16, buf, wasm2go.Inv_727_16)
 		h.ptr = 0
 	}
 }
@@ -147126,7 +147227,7 @@ func (h *ResolvedAggregateHavingModifierProto) UnsafeArenaSetAllocatedParent(val
 func (h *ResolvedAggregateHavingModifierProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(728, 24, buf, wasm2go.Inv_728_24)
+		module().enqueueFree(728, 24, buf, wasm2go.Inv_728_24)
 		h.ptr = 0
 	}
 }
@@ -147187,7 +147288,7 @@ func (h *ResolvedAggregateScan) NodeKindString() (string, error) {
 func (h *ResolvedAggregateScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(729, 4, buf, wasm2go.Inv_729_4)
+		module().enqueueFree(729, 4, buf, wasm2go.Inv_729_4)
 		h.ptr = 0
 	}
 }
@@ -148014,7 +148115,7 @@ func (h *ResolvedAggregateScanBase) SetRollupColumnList(v []*ResolvedColumnRef) 
 func (h *ResolvedAggregateScanBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(730, 48, buf, wasm2go.Inv_730_48)
+		module().enqueueFree(730, 48, buf, wasm2go.Inv_730_48)
 		h.ptr = 0
 	}
 }
@@ -148479,7 +148580,7 @@ func (h *ResolvedAggregateScanBaseProto) UnsafeArenaSetAllocatedParent(value *Re
 func (h *ResolvedAggregateScanBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(731, 50, buf, wasm2go.Inv_731_50)
+		module().enqueueFree(731, 50, buf, wasm2go.Inv_731_50)
 		h.ptr = 0
 	}
 }
@@ -148607,7 +148708,7 @@ func (h *ResolvedAggregateScanProto) UnsafeArenaSetAllocatedParent(value *Resolv
 func (h *ResolvedAggregateScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(732, 12, buf, wasm2go.Inv_732_12)
+		module().enqueueFree(732, 12, buf, wasm2go.Inv_732_12)
 		h.ptr = 0
 	}
 }
@@ -148845,7 +148946,7 @@ func (h *ResolvedAggregationThresholdAggregateScan) SetOptionList(v []*ResolvedO
 func (h *ResolvedAggregationThresholdAggregateScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(733, 16, buf, wasm2go.Inv_733_16)
+		module().enqueueFree(733, 16, buf, wasm2go.Inv_733_16)
 		h.ptr = 0
 	}
 }
@@ -149018,7 +149119,7 @@ func (h *ResolvedAggregationThresholdAggregateScanProto) UnsafeArenaSetAllocated
 func (h *ResolvedAggregationThresholdAggregateScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(734, 17, buf, wasm2go.Inv_734_17)
+		module().enqueueFree(734, 17, buf, wasm2go.Inv_734_17)
 		h.ptr = 0
 	}
 }
@@ -149064,7 +149165,7 @@ func (h *ResolvedAlterAction) ChildrenAccept(visitor *ResolvedASTVisitor) error 
 func (h *ResolvedAlterAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(735, 2, buf, wasm2go.Inv_735_2)
+		module().enqueueFree(735, 2, buf, wasm2go.Inv_735_2)
 		h.ptr = 0
 	}
 }
@@ -149192,7 +149293,7 @@ func (h *ResolvedAlterActionProto) UnsafeArenaSetAllocatedParent(value *Resolved
 func (h *ResolvedAlterActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(736, 12, buf, wasm2go.Inv_736_12)
+		module().enqueueFree(736, 12, buf, wasm2go.Inv_736_12)
 		h.ptr = 0
 	}
 }
@@ -149385,7 +149486,7 @@ func (h *ResolvedAlterAllRowAccessPoliciesStmt) TableScan() (*ResolvedTableScan,
 func (h *ResolvedAlterAllRowAccessPoliciesStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(737, 13, buf, wasm2go.Inv_737_13)
+		module().enqueueFree(737, 13, buf, wasm2go.Inv_737_13)
 		h.ptr = 0
 	}
 }
@@ -149580,7 +149681,7 @@ func (h *ResolvedAlterAllRowAccessPoliciesStmtProto) UnsafeArenaSetAllocatedTabl
 func (h *ResolvedAlterAllRowAccessPoliciesStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(738, 20, buf, wasm2go.Inv_738_20)
+		module().enqueueFree(738, 20, buf, wasm2go.Inv_738_20)
 		h.ptr = 0
 	}
 }
@@ -149645,7 +149746,7 @@ func (h *ResolvedAlterApproxViewStmt) NodeKindString() (string, error) {
 func (h *ResolvedAlterApproxViewStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(739, 4, buf, wasm2go.Inv_739_4)
+		module().enqueueFree(739, 4, buf, wasm2go.Inv_739_4)
 		h.ptr = 0
 	}
 }
@@ -149773,7 +149874,7 @@ func (h *ResolvedAlterApproxViewStmtProto) UnsafeArenaSetAllocatedParent(value *
 func (h *ResolvedAlterApproxViewStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(740, 12, buf, wasm2go.Inv_740_12)
+		module().enqueueFree(740, 12, buf, wasm2go.Inv_740_12)
 		h.ptr = 0
 	}
 }
@@ -149943,7 +150044,7 @@ func (h *ResolvedAlterColumnAction) SetIsIfExists(v bool) error {
 func (h *ResolvedAlterColumnAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(741, 12, buf, wasm2go.Inv_741_12)
+		module().enqueueFree(741, 12, buf, wasm2go.Inv_741_12)
 		h.ptr = 0
 	}
 }
@@ -150155,7 +150256,7 @@ func (h *ResolvedAlterColumnActionProto) UnsafeArenaSetAllocatedParent(value *Re
 func (h *ResolvedAlterColumnActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(742, 22, buf, wasm2go.Inv_742_22)
+		module().enqueueFree(742, 22, buf, wasm2go.Inv_742_22)
 		h.ptr = 0
 	}
 }
@@ -150222,7 +150323,7 @@ func (h *ResolvedAlterColumnDropDefaultAction) NodeKindString() (string, error) 
 func (h *ResolvedAlterColumnDropDefaultAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(743, 4, buf, wasm2go.Inv_743_4)
+		module().enqueueFree(743, 4, buf, wasm2go.Inv_743_4)
 		h.ptr = 0
 	}
 }
@@ -150350,7 +150451,7 @@ func (h *ResolvedAlterColumnDropDefaultActionProto) UnsafeArenaSetAllocatedParen
 func (h *ResolvedAlterColumnDropDefaultActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(744, 12, buf, wasm2go.Inv_744_12)
+		module().enqueueFree(744, 12, buf, wasm2go.Inv_744_12)
 		h.ptr = 0
 	}
 }
@@ -150418,7 +150519,7 @@ func (h *ResolvedAlterColumnDropGeneratedAction) NodeKindString() (string, error
 func (h *ResolvedAlterColumnDropGeneratedAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(745, 4, buf, wasm2go.Inv_745_4)
+		module().enqueueFree(745, 4, buf, wasm2go.Inv_745_4)
 		h.ptr = 0
 	}
 }
@@ -150546,7 +150647,7 @@ func (h *ResolvedAlterColumnDropGeneratedActionProto) UnsafeArenaSetAllocatedPar
 func (h *ResolvedAlterColumnDropGeneratedActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(746, 12, buf, wasm2go.Inv_746_12)
+		module().enqueueFree(746, 12, buf, wasm2go.Inv_746_12)
 		h.ptr = 0
 	}
 }
@@ -150613,7 +150714,7 @@ func (h *ResolvedAlterColumnDropNotNullAction) NodeKindString() (string, error) 
 func (h *ResolvedAlterColumnDropNotNullAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(747, 4, buf, wasm2go.Inv_747_4)
+		module().enqueueFree(747, 4, buf, wasm2go.Inv_747_4)
 		h.ptr = 0
 	}
 }
@@ -150741,7 +150842,7 @@ func (h *ResolvedAlterColumnDropNotNullActionProto) UnsafeArenaSetAllocatedParen
 func (h *ResolvedAlterColumnDropNotNullActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(748, 12, buf, wasm2go.Inv_748_12)
+		module().enqueueFree(748, 12, buf, wasm2go.Inv_748_12)
 		h.ptr = 0
 	}
 }
@@ -150984,7 +151085,7 @@ func (h *ResolvedAlterColumnOptionsAction) SetOptionList(v []*ResolvedOption) er
 func (h *ResolvedAlterColumnOptionsAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(749, 16, buf, wasm2go.Inv_749_16)
+		module().enqueueFree(749, 16, buf, wasm2go.Inv_749_16)
 		h.ptr = 0
 	}
 }
@@ -151157,7 +151258,7 @@ func (h *ResolvedAlterColumnOptionsActionProto) UnsafeArenaSetAllocatedParent(va
 func (h *ResolvedAlterColumnOptionsActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(750, 17, buf, wasm2go.Inv_750_17)
+		module().enqueueFree(750, 17, buf, wasm2go.Inv_750_17)
 		h.ptr = 0
 	}
 }
@@ -151372,7 +151473,7 @@ func (h *ResolvedAlterColumnSetDataTypeAction) UpdatedTypeParameters() (*TypePar
 func (h *ResolvedAlterColumnSetDataTypeAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(751, 17, buf, wasm2go.Inv_751_17)
+		module().enqueueFree(751, 17, buf, wasm2go.Inv_751_17)
 		h.ptr = 0
 	}
 }
@@ -151701,7 +151802,7 @@ func (h *ResolvedAlterColumnSetDataTypeActionProto) UpdatedTypeParameters() (*Ty
 func (h *ResolvedAlterColumnSetDataTypeActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(752, 36, buf, wasm2go.Inv_752_36)
+		module().enqueueFree(752, 36, buf, wasm2go.Inv_752_36)
 		h.ptr = 0
 	}
 }
@@ -151894,7 +151995,7 @@ func (h *ResolvedAlterColumnSetDefaultAction) SetDefaultValue(v *ResolvedColumnD
 func (h *ResolvedAlterColumnSetDefaultAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(753, 13, buf, wasm2go.Inv_753_13)
+		module().enqueueFree(753, 13, buf, wasm2go.Inv_753_13)
 		h.ptr = 0
 	}
 }
@@ -152089,7 +152190,7 @@ func (h *ResolvedAlterColumnSetDefaultActionProto) UnsafeArenaSetAllocatedParent
 func (h *ResolvedAlterColumnSetDefaultActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(754, 20, buf, wasm2go.Inv_754_20)
+		module().enqueueFree(754, 20, buf, wasm2go.Inv_754_20)
 		h.ptr = 0
 	}
 }
@@ -152285,7 +152386,7 @@ func (h *ResolvedAlterColumnSetGeneratedAction) SetGeneratedColumnInfo(v *Resolv
 func (h *ResolvedAlterColumnSetGeneratedAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(755, 13, buf, wasm2go.Inv_755_13)
+		module().enqueueFree(755, 13, buf, wasm2go.Inv_755_13)
 		h.ptr = 0
 	}
 }
@@ -152480,7 +152581,7 @@ func (h *ResolvedAlterColumnSetGeneratedActionProto) UnsafeArenaSetAllocatedPare
 func (h *ResolvedAlterColumnSetGeneratedActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(756, 20, buf, wasm2go.Inv_756_20)
+		module().enqueueFree(756, 20, buf, wasm2go.Inv_756_20)
 		h.ptr = 0
 	}
 }
@@ -152543,7 +152644,7 @@ func (h *ResolvedAlterConnectionStmt) NodeKindString() (string, error) {
 func (h *ResolvedAlterConnectionStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(757, 4, buf, wasm2go.Inv_757_4)
+		module().enqueueFree(757, 4, buf, wasm2go.Inv_757_4)
 		h.ptr = 0
 	}
 }
@@ -152671,7 +152772,7 @@ func (h *ResolvedAlterConnectionStmtProto) UnsafeArenaSetAllocatedParent(value *
 func (h *ResolvedAlterConnectionStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(758, 12, buf, wasm2go.Inv_758_12)
+		module().enqueueFree(758, 12, buf, wasm2go.Inv_758_12)
 		h.ptr = 0
 	}
 }
@@ -152740,7 +152841,7 @@ func (h *ResolvedAlterDatabaseStmt) NodeKindString() (string, error) {
 func (h *ResolvedAlterDatabaseStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(759, 4, buf, wasm2go.Inv_759_4)
+		module().enqueueFree(759, 4, buf, wasm2go.Inv_759_4)
 		h.ptr = 0
 	}
 }
@@ -152868,7 +152969,7 @@ func (h *ResolvedAlterDatabaseStmtProto) UnsafeArenaSetAllocatedParent(value *Re
 func (h *ResolvedAlterDatabaseStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(760, 12, buf, wasm2go.Inv_760_12)
+		module().enqueueFree(760, 12, buf, wasm2go.Inv_760_12)
 		h.ptr = 0
 	}
 }
@@ -153038,7 +153139,7 @@ func (h *ResolvedAlterEntityStmt) SetEntityType(v string) error {
 func (h *ResolvedAlterEntityStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(761, 12, buf, wasm2go.Inv_761_12)
+		module().enqueueFree(761, 12, buf, wasm2go.Inv_761_12)
 		h.ptr = 0
 	}
 }
@@ -153218,7 +153319,7 @@ func (h *ResolvedAlterEntityStmtProto) UnsafeArenaSetAllocatedParent(value *Reso
 func (h *ResolvedAlterEntityStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(762, 18, buf, wasm2go.Inv_762_18)
+		module().enqueueFree(762, 18, buf, wasm2go.Inv_762_18)
 		h.ptr = 0
 	}
 }
@@ -153283,7 +153384,7 @@ func (h *ResolvedAlterExternalSchemaStmt) NodeKindString() (string, error) {
 func (h *ResolvedAlterExternalSchemaStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(763, 4, buf, wasm2go.Inv_763_4)
+		module().enqueueFree(763, 4, buf, wasm2go.Inv_763_4)
 		h.ptr = 0
 	}
 }
@@ -153411,7 +153512,7 @@ func (h *ResolvedAlterExternalSchemaStmtProto) UnsafeArenaSetAllocatedParent(val
 func (h *ResolvedAlterExternalSchemaStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(764, 12, buf, wasm2go.Inv_764_12)
+		module().enqueueFree(764, 12, buf, wasm2go.Inv_764_12)
 		h.ptr = 0
 	}
 }
@@ -153712,7 +153813,7 @@ func (h *ResolvedAlterIndexStmt) TableScan() (*ResolvedTableScan, error) {
 func (h *ResolvedAlterIndexStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(765, 23, buf, wasm2go.Inv_765_23)
+		module().enqueueFree(765, 23, buf, wasm2go.Inv_765_23)
 		h.ptr = 0
 	}
 }
@@ -153984,7 +154085,7 @@ func (h *ResolvedAlterIndexStmtProto) UnsafeArenaSetAllocatedTableScan(value *Re
 func (h *ResolvedAlterIndexStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(766, 29, buf, wasm2go.Inv_766_29)
+		module().enqueueFree(766, 29, buf, wasm2go.Inv_766_29)
 		h.ptr = 0
 	}
 }
@@ -154049,7 +154150,7 @@ func (h *ResolvedAlterMaterializedViewStmt) NodeKindString() (string, error) {
 func (h *ResolvedAlterMaterializedViewStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(767, 4, buf, wasm2go.Inv_767_4)
+		module().enqueueFree(767, 4, buf, wasm2go.Inv_767_4)
 		h.ptr = 0
 	}
 }
@@ -154177,7 +154278,7 @@ func (h *ResolvedAlterMaterializedViewStmtProto) UnsafeArenaSetAllocatedParent(v
 func (h *ResolvedAlterMaterializedViewStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(768, 12, buf, wasm2go.Inv_768_12)
+		module().enqueueFree(768, 12, buf, wasm2go.Inv_768_12)
 		h.ptr = 0
 	}
 }
@@ -154242,7 +154343,7 @@ func (h *ResolvedAlterModelStmt) NodeKindString() (string, error) {
 func (h *ResolvedAlterModelStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(769, 4, buf, wasm2go.Inv_769_4)
+		module().enqueueFree(769, 4, buf, wasm2go.Inv_769_4)
 		h.ptr = 0
 	}
 }
@@ -154370,7 +154471,7 @@ func (h *ResolvedAlterModelStmtProto) UnsafeArenaSetAllocatedParent(value *Resol
 func (h *ResolvedAlterModelStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(770, 12, buf, wasm2go.Inv_770_12)
+		module().enqueueFree(770, 12, buf, wasm2go.Inv_770_12)
 		h.ptr = 0
 	}
 }
@@ -154721,7 +154822,7 @@ func (h *ResolvedAlterObjectStmt) SetNamePath(v []string) error {
 func (h *ResolvedAlterObjectStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(771, 23, buf, wasm2go.Inv_771_23)
+		module().enqueueFree(771, 23, buf, wasm2go.Inv_771_23)
 		h.ptr = 0
 	}
 }
@@ -154971,7 +155072,7 @@ func (h *ResolvedAlterObjectStmtProto) UnsafeArenaSetAllocatedParent(value *Reso
 func (h *ResolvedAlterObjectStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(772, 26, buf, wasm2go.Inv_772_26)
+		module().enqueueFree(772, 26, buf, wasm2go.Inv_772_26)
 		h.ptr = 0
 	}
 }
@@ -155241,7 +155342,7 @@ func (h *ResolvedAlterPrivilegeRestrictionStmt) SetObjectType(v string) error {
 func (h *ResolvedAlterPrivilegeRestrictionStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(773, 18, buf, wasm2go.Inv_773_18)
+		module().enqueueFree(773, 18, buf, wasm2go.Inv_773_18)
 		h.ptr = 0
 	}
 }
@@ -155466,7 +155567,7 @@ func (h *ResolvedAlterPrivilegeRestrictionStmtProto) UnsafeArenaSetAllocatedPare
 func (h *ResolvedAlterPrivilegeRestrictionStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(774, 23, buf, wasm2go.Inv_774_23)
+		module().enqueueFree(774, 23, buf, wasm2go.Inv_774_23)
 		h.ptr = 0
 	}
 }
@@ -155677,7 +155778,7 @@ func (h *ResolvedAlterRowAccessPolicyStmt) TableScan() (*ResolvedTableScan, erro
 func (h *ResolvedAlterRowAccessPolicyStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(775, 15, buf, wasm2go.Inv_775_15)
+		module().enqueueFree(775, 15, buf, wasm2go.Inv_775_15)
 		h.ptr = 0
 	}
 }
@@ -155924,7 +156025,7 @@ func (h *ResolvedAlterRowAccessPolicyStmtProto) UnsafeArenaSetAllocatedTableScan
 func (h *ResolvedAlterRowAccessPolicyStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(776, 26, buf, wasm2go.Inv_776_26)
+		module().enqueueFree(776, 26, buf, wasm2go.Inv_776_26)
 		h.ptr = 0
 	}
 }
@@ -155989,7 +156090,7 @@ func (h *ResolvedAlterSchemaStmt) NodeKindString() (string, error) {
 func (h *ResolvedAlterSchemaStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(777, 4, buf, wasm2go.Inv_777_4)
+		module().enqueueFree(777, 4, buf, wasm2go.Inv_777_4)
 		h.ptr = 0
 	}
 }
@@ -156117,7 +156218,7 @@ func (h *ResolvedAlterSchemaStmtProto) UnsafeArenaSetAllocatedParent(value *Reso
 func (h *ResolvedAlterSchemaStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(778, 12, buf, wasm2go.Inv_778_12)
+		module().enqueueFree(778, 12, buf, wasm2go.Inv_778_12)
 		h.ptr = 0
 	}
 }
@@ -156186,7 +156287,7 @@ func (h *ResolvedAlterSequenceStmt) NodeKindString() (string, error) {
 func (h *ResolvedAlterSequenceStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(779, 4, buf, wasm2go.Inv_779_4)
+		module().enqueueFree(779, 4, buf, wasm2go.Inv_779_4)
 		h.ptr = 0
 	}
 }
@@ -156314,7 +156415,7 @@ func (h *ResolvedAlterSequenceStmtProto) UnsafeArenaSetAllocatedParent(value *Re
 func (h *ResolvedAlterSequenceStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(780, 12, buf, wasm2go.Inv_780_12)
+		module().enqueueFree(780, 12, buf, wasm2go.Inv_780_12)
 		h.ptr = 0
 	}
 }
@@ -156558,7 +156659,7 @@ func (h *ResolvedAlterSubEntityAction) SetName(v string) error {
 func (h *ResolvedAlterSubEntityAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(781, 19, buf, wasm2go.Inv_781_19)
+		module().enqueueFree(781, 19, buf, wasm2go.Inv_781_19)
 		h.ptr = 0
 	}
 }
@@ -156889,7 +156990,7 @@ func (h *ResolvedAlterSubEntityActionProto) UnsafeArenaSetAllocatedParent(value 
 func (h *ResolvedAlterSubEntityActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(782, 36, buf, wasm2go.Inv_782_36)
+		module().enqueueFree(782, 36, buf, wasm2go.Inv_782_36)
 		h.ptr = 0
 	}
 }
@@ -157245,7 +157346,7 @@ func (h *ResolvedAlterTableSetOptionsStmt) SetOptionList(v []*ResolvedOption) er
 func (h *ResolvedAlterTableSetOptionsStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(783, 25, buf, wasm2go.Inv_783_25)
+		module().enqueueFree(783, 25, buf, wasm2go.Inv_783_25)
 		h.ptr = 0
 	}
 }
@@ -157495,7 +157596,7 @@ func (h *ResolvedAlterTableSetOptionsStmtProto) UnsafeArenaSetAllocatedParent(va
 func (h *ResolvedAlterTableSetOptionsStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(784, 26, buf, wasm2go.Inv_784_26)
+		module().enqueueFree(784, 26, buf, wasm2go.Inv_784_26)
 		h.ptr = 0
 	}
 }
@@ -157676,7 +157777,7 @@ func (h *ResolvedAlterTableStmt) TableScan() (*ResolvedTableScan, error) {
 func (h *ResolvedAlterTableStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(785, 13, buf, wasm2go.Inv_785_13)
+		module().enqueueFree(785, 13, buf, wasm2go.Inv_785_13)
 		h.ptr = 0
 	}
 }
@@ -157871,7 +157972,7 @@ func (h *ResolvedAlterTableStmtProto) UnsafeArenaSetAllocatedTableScan(value *Re
 func (h *ResolvedAlterTableStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(786, 20, buf, wasm2go.Inv_786_20)
+		module().enqueueFree(786, 20, buf, wasm2go.Inv_786_20)
 		h.ptr = 0
 	}
 }
@@ -157936,7 +158037,7 @@ func (h *ResolvedAlterViewStmt) NodeKindString() (string, error) {
 func (h *ResolvedAlterViewStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(787, 4, buf, wasm2go.Inv_787_4)
+		module().enqueueFree(787, 4, buf, wasm2go.Inv_787_4)
 		h.ptr = 0
 	}
 }
@@ -158064,7 +158165,7 @@ func (h *ResolvedAlterViewStmtProto) UnsafeArenaSetAllocatedParent(value *Resolv
 func (h *ResolvedAlterViewStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(788, 12, buf, wasm2go.Inv_788_12)
+		module().enqueueFree(788, 12, buf, wasm2go.Inv_788_12)
 		h.ptr = 0
 	}
 }
@@ -158239,7 +158340,7 @@ func (h *ResolvedAnalyticFunctionCall) WindowFrame() (*ResolvedWindowFrame, erro
 func (h *ResolvedAnalyticFunctionCall) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(789, 13, buf, wasm2go.Inv_789_13)
+		module().enqueueFree(789, 13, buf, wasm2go.Inv_789_13)
 		h.ptr = 0
 	}
 }
@@ -158434,7 +158535,7 @@ func (h *ResolvedAnalyticFunctionCallProto) WindowFrame() (*ResolvedWindowFrameP
 func (h *ResolvedAnalyticFunctionCallProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(790, 20, buf, wasm2go.Inv_790_20)
+		module().enqueueFree(790, 20, buf, wasm2go.Inv_790_20)
 		h.ptr = 0
 	}
 }
@@ -158743,7 +158844,7 @@ func (h *ResolvedAnalyticFunctionGroup) SetPartitionBy(v *ResolvedWindowPartitio
 func (h *ResolvedAnalyticFunctionGroup) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(791, 22, buf, wasm2go.Inv_791_22)
+		module().enqueueFree(791, 22, buf, wasm2go.Inv_791_22)
 		h.ptr = 0
 	}
 }
@@ -159050,7 +159151,7 @@ func (h *ResolvedAnalyticFunctionGroupProto) UnsafeArenaSetAllocatedPartitionBy(
 func (h *ResolvedAnalyticFunctionGroupProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(792, 33, buf, wasm2go.Inv_792_33)
+		module().enqueueFree(792, 33, buf, wasm2go.Inv_792_33)
 		h.ptr = 0
 	}
 }
@@ -159325,7 +159426,7 @@ func (h *ResolvedAnalyticScan) SetInputScan(v ResolvedScanNode) error {
 func (h *ResolvedAnalyticScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(793, 19, buf, wasm2go.Inv_793_19)
+		module().enqueueFree(793, 19, buf, wasm2go.Inv_793_19)
 		h.ptr = 0
 	}
 }
@@ -159565,7 +159666,7 @@ func (h *ResolvedAnalyticScanProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedAnalyticScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(794, 25, buf, wasm2go.Inv_794_25)
+		module().enqueueFree(794, 25, buf, wasm2go.Inv_794_25)
 		h.ptr = 0
 	}
 }
@@ -159895,7 +159996,7 @@ func (h *ResolvedAnalyzeStmt) TableAndColumnIndexListSize() (int32, error) {
 func (h *ResolvedAnalyzeStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(795, 22, buf, wasm2go.Inv_795_22)
+		module().enqueueFree(795, 22, buf, wasm2go.Inv_795_22)
 		h.ptr = 0
 	}
 }
@@ -160113,7 +160214,7 @@ func (h *ResolvedAnalyzeStmtProto) UnsafeArenaSetAllocatedParent(value *Resolved
 func (h *ResolvedAnalyzeStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(796, 22, buf, wasm2go.Inv_796_22)
+		module().enqueueFree(796, 22, buf, wasm2go.Inv_796_22)
 		h.ptr = 0
 	}
 }
@@ -160395,7 +160496,7 @@ func (h *ResolvedAnonymizedAggregateScan) SetKThresholdExpr(v ResolvedExprNode) 
 func (h *ResolvedAnonymizedAggregateScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(797, 19, buf, wasm2go.Inv_797_19)
+		module().enqueueFree(797, 19, buf, wasm2go.Inv_797_19)
 		h.ptr = 0
 	}
 }
@@ -160635,7 +160736,7 @@ func (h *ResolvedAnonymizedAggregateScanProto) UnsafeArenaSetAllocatedParent(val
 func (h *ResolvedAnonymizedAggregateScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(798, 25, buf, wasm2go.Inv_798_25)
+		module().enqueueFree(798, 25, buf, wasm2go.Inv_798_25)
 		h.ptr = 0
 	}
 }
@@ -160682,7 +160783,7 @@ func (h *ResolvedArgument) ChildrenAccept(visitor *ResolvedASTVisitor) error {
 func (h *ResolvedArgument) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(799, 2, buf, wasm2go.Inv_799_2)
+		module().enqueueFree(799, 2, buf, wasm2go.Inv_799_2)
 		h.ptr = 0
 	}
 }
@@ -160893,7 +160994,7 @@ func (h *ResolvedArgumentDef) Type() (Googlesql_TypeNode, error) {
 func (h *ResolvedArgumentDef) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(800, 16, buf, wasm2go.Inv_800_16)
+		module().enqueueFree(800, 16, buf, wasm2go.Inv_800_16)
 		h.ptr = 0
 	}
 }
@@ -161172,7 +161273,7 @@ func (h *ResolvedArgumentDefProto) UnsafeArenaSetAllocatedType(value *TypeProto)
 func (h *ResolvedArgumentDefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(801, 30, buf, wasm2go.Inv_801_30)
+		module().enqueueFree(801, 30, buf, wasm2go.Inv_801_30)
 		h.ptr = 0
 	}
 }
@@ -161418,7 +161519,7 @@ func (h *ResolvedArgumentList) SetArgList(v []*ResolvedArgumentDef) error {
 func (h *ResolvedArgumentList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(802, 16, buf, wasm2go.Inv_802_16)
+		module().enqueueFree(802, 16, buf, wasm2go.Inv_802_16)
 		h.ptr = 0
 	}
 }
@@ -161591,7 +161692,7 @@ func (h *ResolvedArgumentListProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedArgumentListProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(803, 17, buf, wasm2go.Inv_803_17)
+		module().enqueueFree(803, 17, buf, wasm2go.Inv_803_17)
 		h.ptr = 0
 	}
 }
@@ -161719,7 +161820,7 @@ func (h *ResolvedArgumentProto) UnsafeArenaSetAllocatedParent(value *ResolvedNod
 func (h *ResolvedArgumentProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(804, 12, buf, wasm2go.Inv_804_12)
+		module().enqueueFree(804, 12, buf, wasm2go.Inv_804_12)
 		h.ptr = 0
 	}
 }
@@ -161906,7 +162007,7 @@ func (h *ResolvedArgumentRef) SetName(v string) error {
 func (h *ResolvedArgumentRef) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(805, 14, buf, wasm2go.Inv_805_14)
+		module().enqueueFree(805, 14, buf, wasm2go.Inv_805_14)
 		h.ptr = 0
 	}
 }
@@ -162118,7 +162219,7 @@ func (h *ResolvedArgumentRefProto) UnsafeArenaSetAllocatedParent(value *Resolved
 func (h *ResolvedArgumentRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(806, 22, buf, wasm2go.Inv_806_22)
+		module().enqueueFree(806, 22, buf, wasm2go.Inv_806_22)
 		h.ptr = 0
 	}
 }
@@ -162460,7 +162561,7 @@ func (h *ResolvedArrayAggregate) SetPreAggregateComputedColumnList(v []*Resolved
 func (h *ResolvedArrayAggregate) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(807, 24, buf, wasm2go.Inv_807_24)
+		module().enqueueFree(807, 24, buf, wasm2go.Inv_807_24)
 		h.ptr = 0
 	}
 }
@@ -162834,7 +162935,7 @@ func (h *ResolvedArrayAggregateProto) UnsafeArenaSetAllocatedParent(value *Resol
 func (h *ResolvedArrayAggregateProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(808, 41, buf, wasm2go.Inv_808_41)
+		module().enqueueFree(808, 41, buf, wasm2go.Inv_808_41)
 		h.ptr = 0
 	}
 }
@@ -163399,7 +163500,7 @@ func (h *ResolvedArrayScan) SetJoinExpr(v ResolvedExprNode) error {
 func (h *ResolvedArrayScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(809, 42, buf, wasm2go.Inv_809_42)
+		module().enqueueFree(809, 42, buf, wasm2go.Inv_809_42)
 		h.ptr = 0
 	}
 }
@@ -163917,7 +164018,7 @@ func (h *ResolvedArrayScanProto) UnsafeArenaSetAllocatedParent(value *ResolvedSc
 func (h *ResolvedArrayScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(810, 58, buf, wasm2go.Inv_810_58)
+		module().enqueueFree(810, 58, buf, wasm2go.Inv_810_58)
 		h.ptr = 0
 	}
 }
@@ -164090,7 +164191,7 @@ func (h *ResolvedAssertRowsModified) SetRows(v ResolvedExprNode) error {
 func (h *ResolvedAssertRowsModified) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(811, 13, buf, wasm2go.Inv_811_13)
+		module().enqueueFree(811, 13, buf, wasm2go.Inv_811_13)
 		h.ptr = 0
 	}
 }
@@ -164285,7 +164386,7 @@ func (h *ResolvedAssertRowsModifiedProto) UnsafeArenaSetAllocatedRows(value *Any
 func (h *ResolvedAssertRowsModifiedProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(812, 20, buf, wasm2go.Inv_812_20)
+		module().enqueueFree(812, 20, buf, wasm2go.Inv_812_20)
 		h.ptr = 0
 	}
 }
@@ -164516,7 +164617,7 @@ func (h *ResolvedAssertScan) SetMessage(v ResolvedExprNode) error {
 func (h *ResolvedAssertScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(813, 19, buf, wasm2go.Inv_813_19)
+		module().enqueueFree(813, 19, buf, wasm2go.Inv_813_19)
 		h.ptr = 0
 	}
 }
@@ -164845,7 +164946,7 @@ func (h *ResolvedAssertScanProto) UnsafeArenaSetAllocatedParent(value *ResolvedS
 func (h *ResolvedAssertScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(814, 36, buf, wasm2go.Inv_814_36)
+		module().enqueueFree(814, 36, buf, wasm2go.Inv_814_36)
 		h.ptr = 0
 	}
 }
@@ -165044,7 +165145,7 @@ func (h *ResolvedAssertStmt) SetExpression(v ResolvedExprNode) error {
 func (h *ResolvedAssertStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(815, 15, buf, wasm2go.Inv_815_15)
+		module().enqueueFree(815, 15, buf, wasm2go.Inv_815_15)
 		h.ptr = 0
 	}
 }
@@ -165291,7 +165392,7 @@ func (h *ResolvedAssertStmtProto) UnsafeArenaSetAllocatedParent(value *ResolvedS
 func (h *ResolvedAssertStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(816, 26, buf, wasm2go.Inv_816_26)
+		module().enqueueFree(816, 26, buf, wasm2go.Inv_816_26)
 		h.ptr = 0
 	}
 }
@@ -165491,7 +165592,7 @@ func (h *ResolvedAssignmentStmt) Target() (ResolvedExprNode, error) {
 func (h *ResolvedAssignmentStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(817, 16, buf, wasm2go.Inv_817_16)
+		module().enqueueFree(817, 16, buf, wasm2go.Inv_817_16)
 		h.ptr = 0
 	}
 }
@@ -165753,7 +165854,7 @@ func (h *ResolvedAssignmentStmtProto) UnsafeArenaSetAllocatedTarget(value *AnyRe
 func (h *ResolvedAssignmentStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(818, 28, buf, wasm2go.Inv_818_28)
+		module().enqueueFree(818, 28, buf, wasm2go.Inv_818_28)
 		h.ptr = 0
 	}
 }
@@ -165952,7 +166053,7 @@ func (h *ResolvedAuxLoadDataPartitionFilter) SetIsOverwrite(v bool) error {
 func (h *ResolvedAuxLoadDataPartitionFilter) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(819, 15, buf, wasm2go.Inv_819_15)
+		module().enqueueFree(819, 15, buf, wasm2go.Inv_819_15)
 		h.ptr = 0
 	}
 }
@@ -166179,7 +166280,7 @@ func (h *ResolvedAuxLoadDataPartitionFilterProto) UnsafeArenaSetAllocatedParent(
 func (h *ResolvedAuxLoadDataPartitionFilterProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(820, 24, buf, wasm2go.Inv_820_24)
+		module().enqueueFree(820, 24, buf, wasm2go.Inv_820_24)
 		h.ptr = 0
 	}
 }
@@ -167539,7 +167640,7 @@ func (h *ResolvedAuxLoadDataStmt) WithPartitionColumns() (*ResolvedWithPartition
 func (h *ResolvedAuxLoadDataStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(821, 88, buf, wasm2go.Inv_821_88)
+		module().enqueueFree(821, 88, buf, wasm2go.Inv_821_88)
 		h.ptr = 0
 	}
 }
@@ -168449,7 +168550,7 @@ func (h *ResolvedAuxLoadDataStmtProto) WithPartitionColumns() (*ResolvedWithPart
 func (h *ResolvedAuxLoadDataStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(822, 102, buf, wasm2go.Inv_822_102)
+		module().enqueueFree(822, 102, buf, wasm2go.Inv_822_102)
 		h.ptr = 0
 	}
 }
@@ -168631,7 +168732,7 @@ func (h *ResolvedBarrierScan) SetInputScan(v ResolvedScanNode, propagateOrder bo
 func (h *ResolvedBarrierScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(823, 13, buf, wasm2go.Inv_823_13)
+		module().enqueueFree(823, 13, buf, wasm2go.Inv_823_13)
 		h.ptr = 0
 	}
 }
@@ -168826,7 +168927,7 @@ func (h *ResolvedBarrierScanProto) UnsafeArenaSetAllocatedParent(value *Resolved
 func (h *ResolvedBarrierScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(824, 20, buf, wasm2go.Inv_824_20)
+		module().enqueueFree(824, 20, buf, wasm2go.Inv_824_20)
 		h.ptr = 0
 	}
 }
@@ -169097,7 +169198,7 @@ func (h *ResolvedBeginStmt) SetReadWriteMode(v ResolvedBeginStmtEnums_ReadWriteM
 func (h *ResolvedBeginStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(825, 19, buf, wasm2go.Inv_825_19)
+		module().enqueueFree(825, 19, buf, wasm2go.Inv_825_19)
 		h.ptr = 0
 	}
 }
@@ -169302,7 +169403,7 @@ func (h *ResolvedBeginStmtProto) UnsafeArenaSetAllocatedParent(value *ResolvedSt
 func (h *ResolvedBeginStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(826, 21, buf, wasm2go.Inv_826_21)
+		module().enqueueFree(826, 21, buf, wasm2go.Inv_826_21)
 		h.ptr = 0
 	}
 }
@@ -169586,7 +169687,7 @@ func (h *ResolvedCallStmt) Signature() (*FunctionSignature, error) {
 func (h *ResolvedCallStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(827, 20, buf, wasm2go.Inv_827_20)
+		module().enqueueFree(827, 20, buf, wasm2go.Inv_827_20)
 		h.ptr = 0
 	}
 }
@@ -169893,7 +169994,7 @@ func (h *ResolvedCallStmtProto) UnsafeArenaSetAllocatedSignature(value *Function
 func (h *ResolvedCallStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(828, 33, buf, wasm2go.Inv_828_33)
+		module().enqueueFree(828, 33, buf, wasm2go.Inv_828_33)
 		h.ptr = 0
 	}
 }
@@ -170249,7 +170350,7 @@ func (h *ResolvedCast) TypeParameters() (*TypeParameters, error) {
 func (h *ResolvedCast) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(829, 28, buf, wasm2go.Inv_829_28)
+		module().enqueueFree(829, 28, buf, wasm2go.Inv_829_28)
 		h.ptr = 0
 	}
 }
@@ -170744,7 +170845,7 @@ func (h *ResolvedCastProto) UnsafeArenaSetAllocatedTypeModifiers(value *TypeModi
 func (h *ResolvedCastProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(830, 56, buf, wasm2go.Inv_830_56)
+		module().enqueueFree(830, 56, buf, wasm2go.Inv_830_56)
 		h.ptr = 0
 	}
 }
@@ -170929,7 +171030,7 @@ func (h *ResolvedCatalogColumnRef) SetName(v string) error {
 func (h *ResolvedCatalogColumnRef) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(831, 14, buf, wasm2go.Inv_831_14)
+		module().enqueueFree(831, 14, buf, wasm2go.Inv_831_14)
 		h.ptr = 0
 	}
 }
@@ -171176,7 +171277,7 @@ func (h *ResolvedCatalogColumnRefProto) UnsafeArenaSetAllocatedParent(value *Res
 func (h *ResolvedCatalogColumnRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(832, 26, buf, wasm2go.Inv_832_26)
+		module().enqueueFree(832, 26, buf, wasm2go.Inv_832_26)
 		h.ptr = 0
 	}
 }
@@ -171497,7 +171598,7 @@ func (h *ResolvedCheckConstraint) SetOptionList(v []*ResolvedOption) error {
 func (h *ResolvedCheckConstraint) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(833, 23, buf, wasm2go.Inv_833_23)
+		module().enqueueFree(833, 23, buf, wasm2go.Inv_833_23)
 		h.ptr = 0
 	}
 }
@@ -171821,7 +171922,7 @@ func (h *ResolvedCheckConstraintProto) UnsafeArenaSetAllocatedParent(value *Reso
 func (h *ResolvedCheckConstraintProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(834, 35, buf, wasm2go.Inv_834_35)
+		module().enqueueFree(834, 35, buf, wasm2go.Inv_834_35)
 		h.ptr = 0
 	}
 }
@@ -172039,7 +172140,7 @@ func (h *ResolvedCloneDataStmt) TargetTable() (*ResolvedTableScan, error) {
 func (h *ResolvedCloneDataStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(835, 16, buf, wasm2go.Inv_835_16)
+		module().enqueueFree(835, 16, buf, wasm2go.Inv_835_16)
 		h.ptr = 0
 	}
 }
@@ -172301,7 +172402,7 @@ func (h *ResolvedCloneDataStmtProto) UnsafeArenaSetAllocatedTargetTable(value *R
 func (h *ResolvedCloneDataStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(836, 28, buf, wasm2go.Inv_836_28)
+		module().enqueueFree(836, 28, buf, wasm2go.Inv_836_28)
 		h.ptr = 0
 	}
 }
@@ -172511,7 +172612,7 @@ func (h *ResolvedCollation) NumChildren() (uint64, error) {
 func (h *ResolvedCollation) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(837, 12, buf, wasm2go.Inv_837_12)
+		module().enqueueFree(837, 12, buf, wasm2go.Inv_837_12)
 		h.ptr = 0
 	}
 }
@@ -172698,7 +172799,7 @@ func (h *ResolvedCollationProto) SetAllocatedCollationName() (string, error) {
 func (h *ResolvedCollationProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(838, 19, buf, wasm2go.Inv_838_19)
+		module().enqueueFree(838, 19, buf, wasm2go.Inv_838_19)
 		h.ptr = 0
 	}
 }
@@ -172963,7 +173064,7 @@ func (h *ResolvedColumn) TypeAnnotationMap() (*AnnotationMap, error) {
 func (h *ResolvedColumn) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(839, 15, buf, wasm2go.Inv_839_15)
+		module().enqueueFree(839, 15, buf, wasm2go.Inv_839_15)
 		h.ptr = 0
 	}
 }
@@ -173385,7 +173486,7 @@ func (h *ResolvedColumnAnnotations) TypeParameters() (*TypeParameters, error) {
 func (h *ResolvedColumnAnnotations) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(840, 30, buf, wasm2go.Inv_840_30)
+		module().enqueueFree(840, 30, buf, wasm2go.Inv_840_30)
 		h.ptr = 0
 	}
 }
@@ -173769,7 +173870,7 @@ func (h *ResolvedColumnAnnotationsProto) UnsafeArenaSetAllocatedTypeParameters(v
 func (h *ResolvedColumnAnnotationsProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(841, 42, buf, wasm2go.Inv_841_42)
+		module().enqueueFree(841, 42, buf, wasm2go.Inv_841_42)
 		h.ptr = 0
 	}
 }
@@ -173953,7 +174054,7 @@ func (h *ResolvedColumnDefaultValue) Sql() (string, error) {
 func (h *ResolvedColumnDefaultValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(842, 15, buf, wasm2go.Inv_842_15)
+		module().enqueueFree(842, 15, buf, wasm2go.Inv_842_15)
 		h.ptr = 0
 	}
 }
@@ -174200,7 +174301,7 @@ func (h *ResolvedColumnDefaultValueProto) UnsafeArenaSetAllocatedParent(value *R
 func (h *ResolvedColumnDefaultValueProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(843, 26, buf, wasm2go.Inv_843_26)
+		module().enqueueFree(843, 26, buf, wasm2go.Inv_843_26)
 		h.ptr = 0
 	}
 }
@@ -174530,7 +174631,7 @@ func (h *ResolvedColumnDefinition) Type() (Googlesql_TypeNode, error) {
 func (h *ResolvedColumnDefinition) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(844, 28, buf, wasm2go.Inv_844_28)
+		module().enqueueFree(844, 28, buf, wasm2go.Inv_844_28)
 		h.ptr = 0
 	}
 }
@@ -175077,7 +175178,7 @@ func (h *ResolvedColumnDefinitionProto) UnsafeArenaSetAllocatedType(value *TypeP
 func (h *ResolvedColumnDefinitionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(845, 62, buf, wasm2go.Inv_845_62)
+		module().enqueueFree(845, 62, buf, wasm2go.Inv_845_62)
 		h.ptr = 0
 	}
 }
@@ -175239,7 +175340,7 @@ func (h *ResolvedColumnHolder) SetColumn(v *ResolvedColumn) error {
 func (h *ResolvedColumnHolder) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(846, 12, buf, wasm2go.Inv_846_12)
+		module().enqueueFree(846, 12, buf, wasm2go.Inv_846_12)
 		h.ptr = 0
 	}
 }
@@ -175434,7 +175535,7 @@ func (h *ResolvedColumnHolderProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedColumnHolderProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(847, 20, buf, wasm2go.Inv_847_20)
+		module().enqueueFree(847, 20, buf, wasm2go.Inv_847_20)
 		h.ptr = 0
 	}
 }
@@ -175785,7 +175886,7 @@ func (h *ResolvedColumnProto) UnsafeArenaSetAllocatedType(value *TypeProto) erro
 func (h *ResolvedColumnProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(848, 39, buf, wasm2go.Inv_848_39)
+		module().enqueueFree(848, 39, buf, wasm2go.Inv_848_39)
 		h.ptr = 0
 	}
 }
@@ -175976,7 +176077,7 @@ func (h *ResolvedColumnRef) SetIsCorrelated(v bool) error {
 func (h *ResolvedColumnRef) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(849, 14, buf, wasm2go.Inv_849_14)
+		module().enqueueFree(849, 14, buf, wasm2go.Inv_849_14)
 		h.ptr = 0
 	}
 }
@@ -176203,7 +176304,7 @@ func (h *ResolvedColumnRefProto) UnsafeArenaSetAllocatedParent(value *ResolvedEx
 func (h *ResolvedColumnRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(850, 24, buf, wasm2go.Inv_850_24)
+		module().enqueueFree(850, 24, buf, wasm2go.Inv_850_24)
 		h.ptr = 0
 	}
 }
@@ -176263,7 +176364,7 @@ func (h *ResolvedCommitStmt) NodeKindString() (string, error) {
 func (h *ResolvedCommitStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(851, 4, buf, wasm2go.Inv_851_4)
+		module().enqueueFree(851, 4, buf, wasm2go.Inv_851_4)
 		h.ptr = 0
 	}
 }
@@ -176391,7 +176492,7 @@ func (h *ResolvedCommitStmtProto) UnsafeArenaSetAllocatedParent(value *ResolvedS
 func (h *ResolvedCommitStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(852, 12, buf, wasm2go.Inv_852_12)
+		module().enqueueFree(852, 12, buf, wasm2go.Inv_852_12)
 		h.ptr = 0
 	}
 }
@@ -176578,7 +176679,7 @@ func (h *ResolvedComputedColumn) SetExpr(v ResolvedExprNode) error {
 func (h *ResolvedComputedColumn) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(853, 15, buf, wasm2go.Inv_853_15)
+		module().enqueueFree(853, 15, buf, wasm2go.Inv_853_15)
 		h.ptr = 0
 	}
 }
@@ -176668,7 +176769,7 @@ func (h *ResolvedComputedColumnBase) Expr() (ResolvedExprNode, error) {
 func (h *ResolvedComputedColumnBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(854, 4, buf, wasm2go.Inv_854_4)
+		module().enqueueFree(854, 4, buf, wasm2go.Inv_854_4)
 		h.ptr = 0
 	}
 }
@@ -176796,7 +176897,7 @@ func (h *ResolvedComputedColumnBaseProto) UnsafeArenaSetAllocatedParent(value *R
 func (h *ResolvedComputedColumnBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(855, 12, buf, wasm2go.Inv_855_12)
+		module().enqueueFree(855, 12, buf, wasm2go.Inv_855_12)
 		h.ptr = 0
 	}
 }
@@ -176843,7 +176944,7 @@ func (h *ResolvedComputedColumnImpl) ChildrenAccept(visitor *ResolvedASTVisitor)
 func (h *ResolvedComputedColumnImpl) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(856, 2, buf, wasm2go.Inv_856_2)
+		module().enqueueFree(856, 2, buf, wasm2go.Inv_856_2)
 		h.ptr = 0
 	}
 }
@@ -176971,7 +177072,7 @@ func (h *ResolvedComputedColumnImplProto) UnsafeArenaSetAllocatedParent(value *R
 func (h *ResolvedComputedColumnImplProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(857, 12, buf, wasm2go.Inv_857_12)
+		module().enqueueFree(857, 12, buf, wasm2go.Inv_857_12)
 		h.ptr = 0
 	}
 }
@@ -177233,7 +177334,7 @@ func (h *ResolvedComputedColumnProto) UnsafeArenaSetAllocatedParent(value *Resol
 func (h *ResolvedComputedColumnProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(858, 28, buf, wasm2go.Inv_858_28)
+		module().enqueueFree(858, 28, buf, wasm2go.Inv_858_28)
 		h.ptr = 0
 	}
 }
@@ -177393,7 +177494,7 @@ func (h *ResolvedConnection) SetConnection(v ConnectionNode) error {
 func (h *ResolvedConnection) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(859, 12, buf, wasm2go.Inv_859_12)
+		module().enqueueFree(859, 12, buf, wasm2go.Inv_859_12)
 		h.ptr = 0
 	}
 }
@@ -177588,7 +177689,7 @@ func (h *ResolvedConnectionProto) UnsafeArenaSetAllocatedParent(value *ResolvedA
 func (h *ResolvedConnectionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(860, 20, buf, wasm2go.Inv_860_20)
+		module().enqueueFree(860, 20, buf, wasm2go.Inv_860_20)
 		h.ptr = 0
 	}
 }
@@ -177747,7 +177848,7 @@ func (h *ResolvedConstant) SetConstant(v ConstantNode) error {
 func (h *ResolvedConstant) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(861, 12, buf, wasm2go.Inv_861_12)
+		module().enqueueFree(861, 12, buf, wasm2go.Inv_861_12)
 		h.ptr = 0
 	}
 }
@@ -177942,7 +178043,7 @@ func (h *ResolvedConstantProto) UnsafeArenaSetAllocatedParent(value *ResolvedExp
 func (h *ResolvedConstantProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(862, 20, buf, wasm2go.Inv_862_20)
+		module().enqueueFree(862, 20, buf, wasm2go.Inv_862_20)
 		h.ptr = 0
 	}
 }
@@ -177986,7 +178087,7 @@ func (h *ResolvedConstraint) ChildrenAccept(visitor *ResolvedASTVisitor) error {
 func (h *ResolvedConstraint) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(863, 2, buf, wasm2go.Inv_863_2)
+		module().enqueueFree(863, 2, buf, wasm2go.Inv_863_2)
 		h.ptr = 0
 	}
 }
@@ -178114,7 +178215,7 @@ func (h *ResolvedConstraintProto) UnsafeArenaSetAllocatedParent(value *ResolvedA
 func (h *ResolvedConstraintProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(864, 12, buf, wasm2go.Inv_864_12)
+		module().enqueueFree(864, 12, buf, wasm2go.Inv_864_12)
 		h.ptr = 0
 	}
 }
@@ -178186,7 +178287,7 @@ func (h *ResolvedCreateApproxViewStmt) NodeKindString() (string, error) {
 func (h *ResolvedCreateApproxViewStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(865, 4, buf, wasm2go.Inv_865_4)
+		module().enqueueFree(865, 4, buf, wasm2go.Inv_865_4)
 		h.ptr = 0
 	}
 }
@@ -178314,7 +178415,7 @@ func (h *ResolvedCreateApproxViewStmtProto) UnsafeArenaSetAllocatedParent(value 
 func (h *ResolvedCreateApproxViewStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(866, 12, buf, wasm2go.Inv_866_12)
+		module().enqueueFree(866, 12, buf, wasm2go.Inv_866_12)
 		h.ptr = 0
 	}
 }
@@ -178558,7 +178659,7 @@ func (h *ResolvedCreateConnectionStmt) SetOptionList(v []*ResolvedOption) error 
 func (h *ResolvedCreateConnectionStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(867, 16, buf, wasm2go.Inv_867_16)
+		module().enqueueFree(867, 16, buf, wasm2go.Inv_867_16)
 		h.ptr = 0
 	}
 }
@@ -178731,7 +178832,7 @@ func (h *ResolvedCreateConnectionStmtProto) UnsafeArenaSetAllocatedParent(value 
 func (h *ResolvedCreateConnectionStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(868, 17, buf, wasm2go.Inv_868_17)
+		module().enqueueFree(868, 17, buf, wasm2go.Inv_868_17)
 		h.ptr = 0
 	}
 }
@@ -178927,7 +179028,7 @@ func (h *ResolvedCreateConstantStmt) SetExpr(v ResolvedExprNode) error {
 func (h *ResolvedCreateConstantStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(869, 13, buf, wasm2go.Inv_869_13)
+		module().enqueueFree(869, 13, buf, wasm2go.Inv_869_13)
 		h.ptr = 0
 	}
 }
@@ -179122,7 +179223,7 @@ func (h *ResolvedCreateConstantStmtProto) UnsafeArenaSetAllocatedParent(value *R
 func (h *ResolvedCreateConstantStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(870, 20, buf, wasm2go.Inv_870_20)
+		module().enqueueFree(870, 20, buf, wasm2go.Inv_870_20)
 		h.ptr = 0
 	}
 }
@@ -179453,7 +179554,7 @@ func (h *ResolvedCreateDatabaseStmt) SetOptionList(v []*ResolvedOption) error {
 func (h *ResolvedCreateDatabaseStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(871, 23, buf, wasm2go.Inv_871_23)
+		module().enqueueFree(871, 23, buf, wasm2go.Inv_871_23)
 		h.ptr = 0
 	}
 }
@@ -179671,7 +179772,7 @@ func (h *ResolvedCreateDatabaseStmtProto) UnsafeArenaSetAllocatedParent(value *R
 func (h *ResolvedCreateDatabaseStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(872, 22, buf, wasm2go.Inv_872_22)
+		module().enqueueFree(872, 22, buf, wasm2go.Inv_872_22)
 		h.ptr = 0
 	}
 }
@@ -179982,7 +180083,7 @@ func (h *ResolvedCreateEntityStmt) SetOptionList(v []*ResolvedOption) error {
 func (h *ResolvedCreateEntityStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(873, 22, buf, wasm2go.Inv_873_22)
+		module().enqueueFree(873, 22, buf, wasm2go.Inv_873_22)
 		h.ptr = 0
 	}
 }
@@ -180311,7 +180412,7 @@ func (h *ResolvedCreateEntityStmtProto) UnsafeArenaSetAllocatedParent(value *Res
 func (h *ResolvedCreateEntityStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(874, 35, buf, wasm2go.Inv_874_35)
+		module().enqueueFree(874, 35, buf, wasm2go.Inv_874_35)
 		h.ptr = 0
 	}
 }
@@ -180494,7 +180595,7 @@ func (h *ResolvedCreateExternalSchemaStmt) SetConnection(v *ResolvedConnection) 
 func (h *ResolvedCreateExternalSchemaStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(875, 13, buf, wasm2go.Inv_875_13)
+		module().enqueueFree(875, 13, buf, wasm2go.Inv_875_13)
 		h.ptr = 0
 	}
 }
@@ -180689,7 +180790,7 @@ func (h *ResolvedCreateExternalSchemaStmtProto) UnsafeArenaSetAllocatedParent(va
 func (h *ResolvedCreateExternalSchemaStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(876, 20, buf, wasm2go.Inv_876_20)
+		module().enqueueFree(876, 20, buf, wasm2go.Inv_876_20)
 		h.ptr = 0
 	}
 }
@@ -180867,7 +180968,7 @@ func (h *ResolvedCreateExternalTableStmt) WithPartitionColumns() (*ResolvedWithP
 func (h *ResolvedCreateExternalTableStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(877, 13, buf, wasm2go.Inv_877_13)
+		module().enqueueFree(877, 13, buf, wasm2go.Inv_877_13)
 		h.ptr = 0
 	}
 }
@@ -181062,7 +181163,7 @@ func (h *ResolvedCreateExternalTableStmtProto) WithPartitionColumns() (*Resolved
 func (h *ResolvedCreateExternalTableStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(878, 20, buf, wasm2go.Inv_878_20)
+		module().enqueueFree(878, 20, buf, wasm2go.Inv_878_20)
 		h.ptr = 0
 	}
 }
@@ -181901,7 +182002,7 @@ func (h *ResolvedCreateFunctionStmt) SqlSecurity() (ResolvedCreateStatementEnums
 func (h *ResolvedCreateFunctionStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(879, 53, buf, wasm2go.Inv_879_53)
+		module().enqueueFree(879, 53, buf, wasm2go.Inv_879_53)
 		h.ptr = 0
 	}
 }
@@ -182696,7 +182797,7 @@ func (h *ResolvedCreateFunctionStmtProto) UnsafeArenaSetAllocatedSignature(value
 func (h *ResolvedCreateFunctionStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(880, 91, buf, wasm2go.Inv_880_91)
+		module().enqueueFree(880, 91, buf, wasm2go.Inv_880_91)
 		h.ptr = 0
 	}
 }
@@ -183630,7 +183731,7 @@ func (h *ResolvedCreateIndexStmt) UnnestExpressionsListSize() (int32, error) {
 func (h *ResolvedCreateIndexStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(881, 64, buf, wasm2go.Inv_881_64)
+		module().enqueueFree(881, 64, buf, wasm2go.Inv_881_64)
 		h.ptr = 0
 	}
 }
@@ -184268,7 +184369,7 @@ func (h *ResolvedCreateIndexStmtProto) UnsafeArenaSetAllocatedTableScan(value *R
 func (h *ResolvedCreateIndexStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(882, 71, buf, wasm2go.Inv_882_71)
+		module().enqueueFree(882, 71, buf, wasm2go.Inv_882_71)
 		h.ptr = 0
 	}
 }
@@ -184649,7 +184750,7 @@ func (h *ResolvedCreateMaterializedViewStmt) SetReplicaSource(v ResolvedScanNode
 func (h *ResolvedCreateMaterializedViewStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(883, 25, buf, wasm2go.Inv_883_25)
+		module().enqueueFree(883, 25, buf, wasm2go.Inv_883_25)
 		h.ptr = 0
 	}
 }
@@ -184934,7 +185035,7 @@ func (h *ResolvedCreateMaterializedViewStmtProto) UnsafeArenaSetAllocatedReplica
 func (h *ResolvedCreateMaterializedViewStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(884, 30, buf, wasm2go.Inv_884_30)
+		module().enqueueFree(884, 30, buf, wasm2go.Inv_884_30)
 		h.ptr = 0
 	}
 }
@@ -185223,7 +185324,7 @@ func (h *ResolvedCreateModelAliasedQuery) SetQuery(v ResolvedScanNode) error {
 func (h *ResolvedCreateModelAliasedQuery) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(885, 21, buf, wasm2go.Inv_885_21)
+		module().enqueueFree(885, 21, buf, wasm2go.Inv_885_21)
 		h.ptr = 0
 	}
 }
@@ -185515,7 +185616,7 @@ func (h *ResolvedCreateModelAliasedQueryProto) UnsafeArenaSetAllocatedQuery(valu
 func (h *ResolvedCreateModelAliasedQueryProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(886, 31, buf, wasm2go.Inv_886_31)
+		module().enqueueFree(886, 31, buf, wasm2go.Inv_886_31)
 		h.ptr = 0
 	}
 }
@@ -186720,7 +186821,7 @@ func (h *ResolvedCreateModelStmt) TransformOutputColumnListSize() (int32, error)
 func (h *ResolvedCreateModelStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(887, 72, buf, wasm2go.Inv_887_72)
+		module().enqueueFree(887, 72, buf, wasm2go.Inv_887_72)
 		h.ptr = 0
 	}
 }
@@ -187419,7 +187520,7 @@ func (h *ResolvedCreateModelStmtProto) UnsafeArenaSetAllocatedQuery(value *AnyRe
 func (h *ResolvedCreateModelStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(888, 77, buf, wasm2go.Inv_888_77)
+		module().enqueueFree(888, 77, buf, wasm2go.Inv_888_77)
 		h.ptr = 0
 	}
 }
@@ -187794,7 +187895,7 @@ func (h *ResolvedCreatePrivilegeRestrictionStmt) SetRestricteeList(v []ResolvedE
 func (h *ResolvedCreatePrivilegeRestrictionStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(889, 24, buf, wasm2go.Inv_889_24)
+		module().enqueueFree(889, 24, buf, wasm2go.Inv_889_24)
 		h.ptr = 0
 	}
 }
@@ -188064,7 +188165,7 @@ func (h *ResolvedCreatePrivilegeRestrictionStmtProto) UnsafeArenaSetAllocatedPar
 func (h *ResolvedCreatePrivilegeRestrictionStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(890, 28, buf, wasm2go.Inv_890_28)
+		module().enqueueFree(890, 28, buf, wasm2go.Inv_890_28)
 		h.ptr = 0
 	}
 }
@@ -188569,7 +188670,7 @@ func (h *ResolvedCreateProcedureStmt) Signature() (*FunctionSignature, error) {
 func (h *ResolvedCreateProcedureStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(891, 36, buf, wasm2go.Inv_891_36)
+		module().enqueueFree(891, 36, buf, wasm2go.Inv_891_36)
 		h.ptr = 0
 	}
 }
@@ -189109,7 +189210,7 @@ func (h *ResolvedCreateProcedureStmtProto) UnsafeArenaSetAllocatedSignature(valu
 func (h *ResolvedCreateProcedureStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(892, 60, buf, wasm2go.Inv_892_60)
+		module().enqueueFree(892, 60, buf, wasm2go.Inv_892_60)
 		h.ptr = 0
 	}
 }
@@ -189728,7 +189829,7 @@ func (h *ResolvedCreatePropertyGraphStmt) SetPropertyDeclarationList(v []*Resolv
 func (h *ResolvedCreatePropertyGraphStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(893, 40, buf, wasm2go.Inv_893_40)
+		module().enqueueFree(893, 40, buf, wasm2go.Inv_893_40)
 		h.ptr = 0
 	}
 }
@@ -190081,7 +190182,7 @@ func (h *ResolvedCreatePropertyGraphStmtProto) UnsafeArenaSetAllocatedParent(val
 func (h *ResolvedCreatePropertyGraphStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(894, 37, buf, wasm2go.Inv_894_37)
+		module().enqueueFree(894, 37, buf, wasm2go.Inv_894_37)
 		h.ptr = 0
 	}
 }
@@ -190672,7 +190773,7 @@ func (h *ResolvedCreateRowAccessPolicyStmt) TargetNamePathSize() (int32, error) 
 func (h *ResolvedCreateRowAccessPolicyStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(895, 42, buf, wasm2go.Inv_895_42)
+		module().enqueueFree(895, 42, buf, wasm2go.Inv_895_42)
 		h.ptr = 0
 	}
 }
@@ -191205,7 +191306,7 @@ func (h *ResolvedCreateRowAccessPolicyStmtProto) UnsafeArenaSetAllocatedTableSca
 func (h *ResolvedCreateRowAccessPolicyStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(896, 59, buf, wasm2go.Inv_896_59)
+		module().enqueueFree(896, 59, buf, wasm2go.Inv_896_59)
 		h.ptr = 0
 	}
 }
@@ -191399,7 +191500,7 @@ func (h *ResolvedCreateSchemaStmt) SetCollationName(v ResolvedExprNode) error {
 func (h *ResolvedCreateSchemaStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(897, 13, buf, wasm2go.Inv_897_13)
+		module().enqueueFree(897, 13, buf, wasm2go.Inv_897_13)
 		h.ptr = 0
 	}
 }
@@ -191639,7 +191740,7 @@ func (h *ResolvedCreateSchemaStmtBase) SetOptionList(v []*ResolvedOption) error 
 func (h *ResolvedCreateSchemaStmtBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(898, 14, buf, wasm2go.Inv_898_14)
+		module().enqueueFree(898, 14, buf, wasm2go.Inv_898_14)
 		h.ptr = 0
 	}
 }
@@ -191812,7 +191913,7 @@ func (h *ResolvedCreateSchemaStmtBaseProto) UnsafeArenaSetAllocatedParent(value 
 func (h *ResolvedCreateSchemaStmtBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(899, 17, buf, wasm2go.Inv_899_17)
+		module().enqueueFree(899, 17, buf, wasm2go.Inv_899_17)
 		h.ptr = 0
 	}
 }
@@ -192007,7 +192108,7 @@ func (h *ResolvedCreateSchemaStmtProto) UnsafeArenaSetAllocatedParent(value *Res
 func (h *ResolvedCreateSchemaStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(900, 20, buf, wasm2go.Inv_900_20)
+		module().enqueueFree(900, 20, buf, wasm2go.Inv_900_20)
 		h.ptr = 0
 	}
 }
@@ -192252,7 +192353,7 @@ func (h *ResolvedCreateSequenceStmt) SetOptionList(v []*ResolvedOption) error {
 func (h *ResolvedCreateSequenceStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(901, 16, buf, wasm2go.Inv_901_16)
+		module().enqueueFree(901, 16, buf, wasm2go.Inv_901_16)
 		h.ptr = 0
 	}
 }
@@ -192425,7 +192526,7 @@ func (h *ResolvedCreateSequenceStmtProto) UnsafeArenaSetAllocatedParent(value *R
 func (h *ResolvedCreateSequenceStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(902, 17, buf, wasm2go.Inv_902_17)
+		module().enqueueFree(902, 17, buf, wasm2go.Inv_902_17)
 		h.ptr = 0
 	}
 }
@@ -192713,7 +192814,7 @@ func (h *ResolvedCreateSnapshotTableStmt) SetOptionList(v []*ResolvedOption) err
 func (h *ResolvedCreateSnapshotTableStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(903, 19, buf, wasm2go.Inv_903_19)
+		module().enqueueFree(903, 19, buf, wasm2go.Inv_903_19)
 		h.ptr = 0
 	}
 }
@@ -192953,7 +193054,7 @@ func (h *ResolvedCreateSnapshotTableStmtProto) UnsafeArenaSetAllocatedParent(val
 func (h *ResolvedCreateSnapshotTableStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(904, 25, buf, wasm2go.Inv_904_25)
+		module().enqueueFree(904, 25, buf, wasm2go.Inv_904_25)
 		h.ptr = 0
 	}
 }
@@ -193225,7 +193326,7 @@ func (h *ResolvedCreateStatement) SetNamePath(v []string) error {
 func (h *ResolvedCreateStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(905, 19, buf, wasm2go.Inv_905_19)
+		module().enqueueFree(905, 19, buf, wasm2go.Inv_905_19)
 		h.ptr = 0
 	}
 }
@@ -193462,7 +193563,7 @@ func (h *ResolvedCreateStatementProto) UnsafeArenaSetAllocatedParent(value *Reso
 func (h *ResolvedCreateStatementProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(906, 25, buf, wasm2go.Inv_906_25)
+		module().enqueueFree(906, 25, buf, wasm2go.Inv_906_25)
 		h.ptr = 0
 	}
 }
@@ -193972,7 +194073,7 @@ func (h *ResolvedCreateTableAsSelectStmt) SetQuery(v ResolvedScanNode) error {
 func (h *ResolvedCreateTableAsSelectStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(907, 31, buf, wasm2go.Inv_907_31)
+		module().enqueueFree(907, 31, buf, wasm2go.Inv_907_31)
 		h.ptr = 0
 	}
 }
@@ -194302,7 +194403,7 @@ func (h *ResolvedCreateTableAsSelectStmtProto) UnsafeArenaSetAllocatedQuery(valu
 func (h *ResolvedCreateTableAsSelectStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(908, 35, buf, wasm2go.Inv_908_35)
+		module().enqueueFree(908, 35, buf, wasm2go.Inv_908_35)
 		h.ptr = 0
 	}
 }
@@ -194997,7 +195098,7 @@ func (h *ResolvedCreateTableFunctionStmt) SqlSecurity() (ResolvedCreateStatement
 func (h *ResolvedCreateTableFunctionStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(909, 44, buf, wasm2go.Inv_909_44)
+		module().enqueueFree(909, 44, buf, wasm2go.Inv_909_44)
 		h.ptr = 0
 	}
 }
@@ -195594,7 +195695,7 @@ func (h *ResolvedCreateTableFunctionStmtProto) UnsafeArenaSetAllocatedSignature(
 func (h *ResolvedCreateTableFunctionStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(910, 67, buf, wasm2go.Inv_910_67)
+		module().enqueueFree(910, 67, buf, wasm2go.Inv_910_67)
 		h.ptr = 0
 	}
 }
@@ -196047,7 +196148,7 @@ func (h *ResolvedCreateTableStmt) SetPartitionByList(v []ResolvedExprNode) error
 func (h *ResolvedCreateTableStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(911, 28, buf, wasm2go.Inv_911_28)
+		module().enqueueFree(911, 28, buf, wasm2go.Inv_911_28)
 		h.ptr = 0
 	}
 }
@@ -196843,7 +196944,7 @@ func (h *ResolvedCreateTableStmtBase) SetPseudoColumnList(v []*ResolvedColumn) e
 func (h *ResolvedCreateTableStmtBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(912, 52, buf, wasm2go.Inv_912_52)
+		module().enqueueFree(912, 52, buf, wasm2go.Inv_912_52)
 		h.ptr = 0
 	}
 }
@@ -197496,7 +197597,7 @@ func (h *ResolvedCreateTableStmtBaseProto) UnsafeArenaSetAllocatedPrimaryKey(val
 func (h *ResolvedCreateTableStmtBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(913, 73, buf, wasm2go.Inv_913_73)
+		module().enqueueFree(913, 73, buf, wasm2go.Inv_913_73)
 		h.ptr = 0
 	}
 }
@@ -197848,7 +197949,7 @@ func (h *ResolvedCreateTableStmtProto) UnsafeArenaSetAllocatedParent(value *Reso
 func (h *ResolvedCreateTableStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(914, 38, buf, wasm2go.Inv_914_38)
+		module().enqueueFree(914, 38, buf, wasm2go.Inv_914_38)
 		h.ptr = 0
 	}
 }
@@ -198446,7 +198547,7 @@ func (h *ResolvedCreateViewBase) SqlSecurity() (ResolvedCreateStatementEnums_Sql
 func (h *ResolvedCreateViewBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(915, 39, buf, wasm2go.Inv_915_39)
+		module().enqueueFree(915, 39, buf, wasm2go.Inv_915_39)
 		h.ptr = 0
 	}
 }
@@ -198956,7 +199057,7 @@ func (h *ResolvedCreateViewBaseProto) UnsafeArenaSetAllocatedQuery(value *AnyRes
 func (h *ResolvedCreateViewBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(916, 57, buf, wasm2go.Inv_916_57)
+		module().enqueueFree(916, 57, buf, wasm2go.Inv_916_57)
 		h.ptr = 0
 	}
 }
@@ -199019,7 +199120,7 @@ func (h *ResolvedCreateViewStmt) NodeKindString() (string, error) {
 func (h *ResolvedCreateViewStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(917, 4, buf, wasm2go.Inv_917_4)
+		module().enqueueFree(917, 4, buf, wasm2go.Inv_917_4)
 		h.ptr = 0
 	}
 }
@@ -199147,7 +199248,7 @@ func (h *ResolvedCreateViewStmtProto) UnsafeArenaSetAllocatedParent(value *Resol
 func (h *ResolvedCreateViewStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(918, 12, buf, wasm2go.Inv_918_12)
+		module().enqueueFree(918, 12, buf, wasm2go.Inv_918_12)
 		h.ptr = 0
 	}
 }
@@ -199325,7 +199426,7 @@ func (h *ResolvedCreateWithEntryStmt) WithEntry() (*ResolvedWithEntry, error) {
 func (h *ResolvedCreateWithEntryStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(919, 13, buf, wasm2go.Inv_919_13)
+		module().enqueueFree(919, 13, buf, wasm2go.Inv_919_13)
 		h.ptr = 0
 	}
 }
@@ -199520,7 +199621,7 @@ func (h *ResolvedCreateWithEntryStmtProto) WithEntry() (*ResolvedWithEntryProto,
 func (h *ResolvedCreateWithEntryStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(920, 20, buf, wasm2go.Inv_920_20)
+		module().enqueueFree(920, 20, buf, wasm2go.Inv_920_20)
 		h.ptr = 0
 	}
 }
@@ -199754,7 +199855,7 @@ func (h *ResolvedCube) SetCubeColumnList(v []*ResolvedGroupingSetMultiColumn) er
 func (h *ResolvedCube) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(921, 16, buf, wasm2go.Inv_921_16)
+		module().enqueueFree(921, 16, buf, wasm2go.Inv_921_16)
 		h.ptr = 0
 	}
 }
@@ -199927,7 +200028,7 @@ func (h *ResolvedCubeProto) UnsafeArenaSetAllocatedParent(value *ResolvedGroupin
 func (h *ResolvedCubeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(922, 17, buf, wasm2go.Inv_922_17)
+		module().enqueueFree(922, 17, buf, wasm2go.Inv_922_17)
 		h.ptr = 0
 	}
 }
@@ -199992,7 +200093,7 @@ func (h *ResolvedDMLDefault) NodeKindString() (string, error) {
 func (h *ResolvedDMLDefault) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(923, 4, buf, wasm2go.Inv_923_4)
+		module().enqueueFree(923, 4, buf, wasm2go.Inv_923_4)
 		h.ptr = 0
 	}
 }
@@ -200120,7 +200221,7 @@ func (h *ResolvedDMLDefaultProto) UnsafeArenaSetAllocatedParent(value *ResolvedE
 func (h *ResolvedDMLDefaultProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(924, 12, buf, wasm2go.Inv_924_12)
+		module().enqueueFree(924, 12, buf, wasm2go.Inv_924_12)
 		h.ptr = 0
 	}
 }
@@ -200295,7 +200396,7 @@ func (h *ResolvedDMLValue) Value() (ResolvedExprNode, error) {
 func (h *ResolvedDMLValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(925, 13, buf, wasm2go.Inv_925_13)
+		module().enqueueFree(925, 13, buf, wasm2go.Inv_925_13)
 		h.ptr = 0
 	}
 }
@@ -200490,7 +200591,7 @@ func (h *ResolvedDMLValueProto) Value() (*AnyResolvedExprProto, error) {
 func (h *ResolvedDMLValueProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(926, 20, buf, wasm2go.Inv_926_20)
+		module().enqueueFree(926, 20, buf, wasm2go.Inv_926_20)
 		h.ptr = 0
 	}
 }
@@ -200719,7 +200820,7 @@ func (h *ResolvedDeferredComputedColumn) SideEffectColumn() (*ResolvedColumn, er
 func (h *ResolvedDeferredComputedColumn) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(927, 17, buf, wasm2go.Inv_927_17)
+		module().enqueueFree(927, 17, buf, wasm2go.Inv_927_17)
 		h.ptr = 0
 	}
 }
@@ -201048,7 +201149,7 @@ func (h *ResolvedDeferredComputedColumnProto) UnsafeArenaSetAllocatedSideEffectC
 func (h *ResolvedDeferredComputedColumnProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(928, 36, buf, wasm2go.Inv_928_36)
+		module().enqueueFree(928, 36, buf, wasm2go.Inv_928_36)
 		h.ptr = 0
 	}
 }
@@ -201376,7 +201477,7 @@ func (h *ResolvedDefineTableStmt) SetOptionList(v []*ResolvedOption) error {
 func (h *ResolvedDefineTableStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(929, 23, buf, wasm2go.Inv_929_23)
+		module().enqueueFree(929, 23, buf, wasm2go.Inv_929_23)
 		h.ptr = 0
 	}
 }
@@ -201594,7 +201695,7 @@ func (h *ResolvedDefineTableStmtProto) UnsafeArenaSetAllocatedParent(value *Reso
 func (h *ResolvedDefineTableStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(930, 22, buf, wasm2go.Inv_930_22)
+		module().enqueueFree(930, 22, buf, wasm2go.Inv_930_22)
 		h.ptr = 0
 	}
 }
@@ -202026,7 +202127,7 @@ func (h *ResolvedDeleteStmt) WhereExpr() (ResolvedExprNode, error) {
 func (h *ResolvedDeleteStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(931, 32, buf, wasm2go.Inv_931_32)
+		module().enqueueFree(931, 32, buf, wasm2go.Inv_931_32)
 		h.ptr = 0
 	}
 }
@@ -202530,7 +202631,7 @@ func (h *ResolvedDeleteStmtProto) WhereExpr() (*AnyResolvedExprProto, error) {
 func (h *ResolvedDeleteStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(932, 57, buf, wasm2go.Inv_932_57)
+		module().enqueueFree(932, 57, buf, wasm2go.Inv_932_57)
 		h.ptr = 0
 	}
 }
@@ -202739,7 +202840,7 @@ func (h *ResolvedDescribeScan) SetInputScan(v ResolvedScanNode) error {
 func (h *ResolvedDescribeScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(933, 16, buf, wasm2go.Inv_933_16)
+		module().enqueueFree(933, 16, buf, wasm2go.Inv_933_16)
 		h.ptr = 0
 	}
 }
@@ -203001,7 +203102,7 @@ func (h *ResolvedDescribeScanProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedDescribeScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(934, 28, buf, wasm2go.Inv_934_28)
+		module().enqueueFree(934, 28, buf, wasm2go.Inv_934_28)
 		h.ptr = 0
 	}
 }
@@ -203358,7 +203459,7 @@ func (h *ResolvedDescribeStmt) SetObjectType(v string) error {
 func (h *ResolvedDescribeStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(935, 26, buf, wasm2go.Inv_935_26)
+		module().enqueueFree(935, 26, buf, wasm2go.Inv_935_26)
 		h.ptr = 0
 	}
 }
@@ -203628,7 +203729,7 @@ func (h *ResolvedDescribeStmtProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedDescribeStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(936, 28, buf, wasm2go.Inv_936_28)
+		module().enqueueFree(936, 28, buf, wasm2go.Inv_936_28)
 		h.ptr = 0
 	}
 }
@@ -203985,7 +204086,7 @@ func (h *ResolvedDescriptor) SetDescriptorColumnNameList(v []string) error {
 func (h *ResolvedDescriptor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(937, 24, buf, wasm2go.Inv_937_24)
+		module().enqueueFree(937, 24, buf, wasm2go.Inv_937_24)
 		h.ptr = 0
 	}
 }
@@ -204203,7 +204304,7 @@ func (h *ResolvedDescriptorProto) UnsafeArenaSetAllocatedParent(value *ResolvedA
 func (h *ResolvedDescriptorProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(938, 22, buf, wasm2go.Inv_938_22)
+		module().enqueueFree(938, 22, buf, wasm2go.Inv_938_22)
 		h.ptr = 0
 	}
 }
@@ -204486,7 +204587,7 @@ func (h *ResolvedDifferentialPrivacyAggregateScan) SetOptionList(v []*ResolvedOp
 func (h *ResolvedDifferentialPrivacyAggregateScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(939, 19, buf, wasm2go.Inv_939_19)
+		module().enqueueFree(939, 19, buf, wasm2go.Inv_939_19)
 		h.ptr = 0
 	}
 }
@@ -204726,7 +204827,7 @@ func (h *ResolvedDifferentialPrivacyAggregateScanProto) UnsafeArenaSetAllocatedP
 func (h *ResolvedDifferentialPrivacyAggregateScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(940, 25, buf, wasm2go.Inv_940_25)
+		module().enqueueFree(940, 25, buf, wasm2go.Inv_940_25)
 		h.ptr = 0
 	}
 }
@@ -204903,7 +205004,7 @@ func (h *ResolvedDropColumnAction) SetName(v string) error {
 func (h *ResolvedDropColumnAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(941, 14, buf, wasm2go.Inv_941_14)
+		module().enqueueFree(941, 14, buf, wasm2go.Inv_941_14)
 		h.ptr = 0
 	}
 }
@@ -205115,7 +205216,7 @@ func (h *ResolvedDropColumnActionProto) UnsafeArenaSetAllocatedParent(value *Res
 func (h *ResolvedDropColumnActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(942, 22, buf, wasm2go.Inv_942_22)
+		module().enqueueFree(942, 22, buf, wasm2go.Inv_942_22)
 		h.ptr = 0
 	}
 }
@@ -205289,7 +205390,7 @@ func (h *ResolvedDropConstraintAction) SetName(v string) error {
 func (h *ResolvedDropConstraintAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(943, 14, buf, wasm2go.Inv_943_14)
+		module().enqueueFree(943, 14, buf, wasm2go.Inv_943_14)
 		h.ptr = 0
 	}
 }
@@ -205501,7 +205602,7 @@ func (h *ResolvedDropConstraintActionProto) UnsafeArenaSetAllocatedParent(value 
 func (h *ResolvedDropConstraintActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(944, 22, buf, wasm2go.Inv_944_22)
+		module().enqueueFree(944, 22, buf, wasm2go.Inv_944_22)
 		h.ptr = 0
 	}
 }
@@ -205848,7 +205949,7 @@ func (h *ResolvedDropFunctionStmt) Signature() (*ResolvedFunctionSignatureHolder
 func (h *ResolvedDropFunctionStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(945, 25, buf, wasm2go.Inv_945_25)
+		module().enqueueFree(945, 25, buf, wasm2go.Inv_945_25)
 		h.ptr = 0
 	}
 }
@@ -206187,7 +206288,7 @@ func (h *ResolvedDropFunctionStmtProto) UnsafeArenaSetAllocatedSignature(value *
 func (h *ResolvedDropFunctionStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(946, 37, buf, wasm2go.Inv_946_37)
+		module().enqueueFree(946, 37, buf, wasm2go.Inv_946_37)
 		h.ptr = 0
 	}
 }
@@ -206488,7 +206589,7 @@ func (h *ResolvedDropIndexStmt) TableNamePathSize() (int32, error) {
 func (h *ResolvedDropIndexStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(947, 24, buf, wasm2go.Inv_947_24)
+		module().enqueueFree(947, 24, buf, wasm2go.Inv_947_24)
 		h.ptr = 0
 	}
 }
@@ -206777,7 +206878,7 @@ func (h *ResolvedDropIndexStmtProto) UnsafeArenaSetAllocatedParent(value *Resolv
 func (h *ResolvedDropIndexStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(948, 31, buf, wasm2go.Inv_948_31)
+		module().enqueueFree(948, 31, buf, wasm2go.Inv_948_31)
 		h.ptr = 0
 	}
 }
@@ -207034,7 +207135,7 @@ func (h *ResolvedDropMaterializedViewStmt) SetNamePath(v []string) error {
 func (h *ResolvedDropMaterializedViewStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(949, 19, buf, wasm2go.Inv_949_19)
+		module().enqueueFree(949, 19, buf, wasm2go.Inv_949_19)
 		h.ptr = 0
 	}
 }
@@ -207239,7 +207340,7 @@ func (h *ResolvedDropMaterializedViewStmtProto) UnsafeArenaSetAllocatedParent(va
 func (h *ResolvedDropMaterializedViewStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(950, 21, buf, wasm2go.Inv_950_21)
+		module().enqueueFree(950, 21, buf, wasm2go.Inv_950_21)
 		h.ptr = 0
 	}
 }
@@ -207397,7 +207498,7 @@ func (h *ResolvedDropPrimaryKeyAction) SetIsIfExists(v bool) error {
 func (h *ResolvedDropPrimaryKeyAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(951, 12, buf, wasm2go.Inv_951_12)
+		module().enqueueFree(951, 12, buf, wasm2go.Inv_951_12)
 		h.ptr = 0
 	}
 }
@@ -207557,7 +207658,7 @@ func (h *ResolvedDropPrimaryKeyActionProto) UnsafeArenaSetAllocatedParent(value 
 func (h *ResolvedDropPrimaryKeyActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(952, 16, buf, wasm2go.Inv_952_16)
+		module().enqueueFree(952, 16, buf, wasm2go.Inv_952_16)
 		h.ptr = 0
 	}
 }
@@ -207932,7 +208033,7 @@ func (h *ResolvedDropPrivilegeRestrictionStmt) SetObjectType(v string) error {
 func (h *ResolvedDropPrivilegeRestrictionStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(953, 27, buf, wasm2go.Inv_953_27)
+		module().enqueueFree(953, 27, buf, wasm2go.Inv_953_27)
 		h.ptr = 0
 	}
 }
@@ -208234,7 +208335,7 @@ func (h *ResolvedDropPrivilegeRestrictionStmtProto) UnsafeArenaSetAllocatedParen
 func (h *ResolvedDropPrivilegeRestrictionStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(954, 32, buf, wasm2go.Inv_954_32)
+		module().enqueueFree(954, 32, buf, wasm2go.Inv_954_32)
 		h.ptr = 0
 	}
 }
@@ -208541,7 +208642,7 @@ func (h *ResolvedDropRowAccessPolicyStmt) TargetNamePathSize() (int32, error) {
 func (h *ResolvedDropRowAccessPolicyStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(955, 23, buf, wasm2go.Inv_955_23)
+		module().enqueueFree(955, 23, buf, wasm2go.Inv_955_23)
 		h.ptr = 0
 	}
 }
@@ -208830,7 +208931,7 @@ func (h *ResolvedDropRowAccessPolicyStmtProto) UnsafeArenaSetAllocatedParent(val
 func (h *ResolvedDropRowAccessPolicyStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(956, 31, buf, wasm2go.Inv_956_31)
+		module().enqueueFree(956, 31, buf, wasm2go.Inv_956_31)
 		h.ptr = 0
 	}
 }
@@ -209087,7 +209188,7 @@ func (h *ResolvedDropSnapshotTableStmt) SetNamePath(v []string) error {
 func (h *ResolvedDropSnapshotTableStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(957, 19, buf, wasm2go.Inv_957_19)
+		module().enqueueFree(957, 19, buf, wasm2go.Inv_957_19)
 		h.ptr = 0
 	}
 }
@@ -209292,7 +209393,7 @@ func (h *ResolvedDropSnapshotTableStmtProto) UnsafeArenaSetAllocatedParent(value
 func (h *ResolvedDropSnapshotTableStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(958, 21, buf, wasm2go.Inv_958_21)
+		module().enqueueFree(958, 21, buf, wasm2go.Inv_958_21)
 		h.ptr = 0
 	}
 }
@@ -209593,7 +209694,7 @@ func (h *ResolvedDropStmt) SetObjectType(v string) error {
 func (h *ResolvedDropStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(959, 23, buf, wasm2go.Inv_959_23)
+		module().enqueueFree(959, 23, buf, wasm2go.Inv_959_23)
 		h.ptr = 0
 	}
 }
@@ -209882,7 +209983,7 @@ func (h *ResolvedDropStmtProto) UnsafeArenaSetAllocatedParent(value *ResolvedSta
 func (h *ResolvedDropStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(960, 31, buf, wasm2go.Inv_960_31)
+		module().enqueueFree(960, 31, buf, wasm2go.Inv_960_31)
 		h.ptr = 0
 	}
 }
@@ -210092,7 +210193,7 @@ func (h *ResolvedDropSubEntityAction) SetName(v string) error {
 func (h *ResolvedDropSubEntityAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(961, 16, buf, wasm2go.Inv_961_16)
+		module().enqueueFree(961, 16, buf, wasm2go.Inv_961_16)
 		h.ptr = 0
 	}
 }
@@ -210356,7 +210457,7 @@ func (h *ResolvedDropSubEntityActionProto) UnsafeArenaSetAllocatedParent(value *
 func (h *ResolvedDropSubEntityActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(962, 28, buf, wasm2go.Inv_962_28)
+		module().enqueueFree(962, 28, buf, wasm2go.Inv_962_28)
 		h.ptr = 0
 	}
 }
@@ -210611,7 +210712,7 @@ func (h *ResolvedDropTableFunctionStmt) SetNamePath(v []string) error {
 func (h *ResolvedDropTableFunctionStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(963, 19, buf, wasm2go.Inv_963_19)
+		module().enqueueFree(963, 19, buf, wasm2go.Inv_963_19)
 		h.ptr = 0
 	}
 }
@@ -210816,7 +210917,7 @@ func (h *ResolvedDropTableFunctionStmtProto) UnsafeArenaSetAllocatedParent(value
 func (h *ResolvedDropTableFunctionStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(964, 21, buf, wasm2go.Inv_964_21)
+		module().enqueueFree(964, 21, buf, wasm2go.Inv_964_21)
 		h.ptr = 0
 	}
 }
@@ -211045,7 +211146,7 @@ func (h *ResolvedExecuteAsRoleScan) SetOriginalInlinedView(v TableNode) error {
 func (h *ResolvedExecuteAsRoleScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(965, 17, buf, wasm2go.Inv_965_17)
+		module().enqueueFree(965, 17, buf, wasm2go.Inv_965_17)
 		h.ptr = 0
 	}
 }
@@ -211374,7 +211475,7 @@ func (h *ResolvedExecuteAsRoleScanProto) UnsafeArenaSetAllocatedParent(value *Re
 func (h *ResolvedExecuteAsRoleScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(966, 36, buf, wasm2go.Inv_966_36)
+		module().enqueueFree(966, 36, buf, wasm2go.Inv_966_36)
 		h.ptr = 0
 	}
 }
@@ -211565,7 +211666,7 @@ func (h *ResolvedExecuteImmediateArgument) SetName(v string) error {
 func (h *ResolvedExecuteImmediateArgument) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(967, 15, buf, wasm2go.Inv_967_15)
+		module().enqueueFree(967, 15, buf, wasm2go.Inv_967_15)
 		h.ptr = 0
 	}
 }
@@ -211812,7 +211913,7 @@ func (h *ResolvedExecuteImmediateArgumentProto) UnsafeArenaSetAllocatedParent(va
 func (h *ResolvedExecuteImmediateArgumentProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(968, 26, buf, wasm2go.Inv_968_26)
+		module().enqueueFree(968, 26, buf, wasm2go.Inv_968_26)
 		h.ptr = 0
 	}
 }
@@ -212182,7 +212283,7 @@ func (h *ResolvedExecuteImmediateStmt) UsingArgumentListSize() (int32, error) {
 func (h *ResolvedExecuteImmediateStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(969, 26, buf, wasm2go.Inv_969_26)
+		module().enqueueFree(969, 26, buf, wasm2go.Inv_969_26)
 		h.ptr = 0
 	}
 }
@@ -212467,7 +212568,7 @@ func (h *ResolvedExecuteImmediateStmtProto) UsingArgumentListSize() (int32, erro
 func (h *ResolvedExecuteImmediateStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(970, 30, buf, wasm2go.Inv_970_30)
+		module().enqueueFree(970, 30, buf, wasm2go.Inv_970_30)
 		h.ptr = 0
 	}
 }
@@ -212640,7 +212741,7 @@ func (h *ResolvedExplainStmt) Statement() (ResolvedStatementNode, error) {
 func (h *ResolvedExplainStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(971, 13, buf, wasm2go.Inv_971_13)
+		module().enqueueFree(971, 13, buf, wasm2go.Inv_971_13)
 		h.ptr = 0
 	}
 }
@@ -212835,7 +212936,7 @@ func (h *ResolvedExplainStmtProto) UnsafeArenaSetAllocatedStatement(value *AnyRe
 func (h *ResolvedExplainStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(972, 20, buf, wasm2go.Inv_972_20)
+		module().enqueueFree(972, 20, buf, wasm2go.Inv_972_20)
 		h.ptr = 0
 	}
 }
@@ -213281,7 +213382,7 @@ func (h *ResolvedExportDataStmt) SetQuery(v ResolvedScanNode) error {
 func (h *ResolvedExportDataStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(973, 30, buf, wasm2go.Inv_973_30)
+		module().enqueueFree(973, 30, buf, wasm2go.Inv_973_30)
 		h.ptr = 0
 	}
 }
@@ -213665,7 +213766,7 @@ func (h *ResolvedExportDataStmtProto) UnsafeArenaSetAllocatedQuery(value *AnyRes
 func (h *ResolvedExportDataStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(974, 42, buf, wasm2go.Inv_974_42)
+		module().enqueueFree(974, 42, buf, wasm2go.Inv_974_42)
 		h.ptr = 0
 	}
 }
@@ -214057,7 +214158,7 @@ func (h *ResolvedExportMetadataStmt) SetSchemaObjectKind(v string) error {
 func (h *ResolvedExportMetadataStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(975, 28, buf, wasm2go.Inv_975_28)
+		module().enqueueFree(975, 28, buf, wasm2go.Inv_975_28)
 		h.ptr = 0
 	}
 }
@@ -214394,7 +214495,7 @@ func (h *ResolvedExportMetadataStmtProto) UnsafeArenaSetAllocatedParent(value *R
 func (h *ResolvedExportMetadataStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(976, 36, buf, wasm2go.Inv_976_36)
+		module().enqueueFree(976, 36, buf, wasm2go.Inv_976_36)
 		h.ptr = 0
 	}
 }
@@ -214760,7 +214861,7 @@ func (h *ResolvedExportModelStmt) SetOptionList(v []*ResolvedOption) error {
 func (h *ResolvedExportModelStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(977, 26, buf, wasm2go.Inv_977_26)
+		module().enqueueFree(977, 26, buf, wasm2go.Inv_977_26)
 		h.ptr = 0
 	}
 }
@@ -215045,7 +215146,7 @@ func (h *ResolvedExportModelStmtProto) UnsafeArenaSetAllocatedParent(value *Reso
 func (h *ResolvedExportModelStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(978, 30, buf, wasm2go.Inv_978_30)
+		module().enqueueFree(978, 30, buf, wasm2go.Inv_978_30)
 		h.ptr = 0
 	}
 }
@@ -215231,7 +215332,7 @@ func (h *ResolvedExpr) TypeAnnotationMap() (*AnnotationMap, error) {
 func (h *ResolvedExpr) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(979, 14, buf, wasm2go.Inv_979_14)
+		module().enqueueFree(979, 14, buf, wasm2go.Inv_979_14)
 		h.ptr = 0
 	}
 }
@@ -215493,7 +215594,7 @@ func (h *ResolvedExprProto) UnsafeArenaSetAllocatedTypeAnnotationMap(value *Anno
 func (h *ResolvedExprProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(980, 28, buf, wasm2go.Inv_980_28)
+		module().enqueueFree(980, 28, buf, wasm2go.Inv_980_28)
 		h.ptr = 0
 	}
 }
@@ -215657,7 +215758,7 @@ func (h *ResolvedExpressionColumn) SetName(v string) error {
 func (h *ResolvedExpressionColumn) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(981, 12, buf, wasm2go.Inv_981_12)
+		module().enqueueFree(981, 12, buf, wasm2go.Inv_981_12)
 		h.ptr = 0
 	}
 }
@@ -215837,7 +215938,7 @@ func (h *ResolvedExpressionColumnProto) UnsafeArenaSetAllocatedParent(value *Res
 func (h *ResolvedExpressionColumnProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(982, 18, buf, wasm2go.Inv_982_18)
+		module().enqueueFree(982, 18, buf, wasm2go.Inv_982_18)
 		h.ptr = 0
 	}
 }
@@ -216074,7 +216175,7 @@ func (h *ResolvedExtendedCast) SetElementList(v []*ResolvedExtendedCastElement) 
 func (h *ResolvedExtendedCast) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(983, 16, buf, wasm2go.Inv_983_16)
+		module().enqueueFree(983, 16, buf, wasm2go.Inv_983_16)
 		h.ptr = 0
 	}
 }
@@ -216268,7 +216369,7 @@ func (h *ResolvedExtendedCastElement) ToType() (Googlesql_TypeNode, error) {
 func (h *ResolvedExtendedCastElement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(984, 16, buf, wasm2go.Inv_984_16)
+		module().enqueueFree(984, 16, buf, wasm2go.Inv_984_16)
 		h.ptr = 0
 	}
 }
@@ -216597,7 +216698,7 @@ func (h *ResolvedExtendedCastElementProto) UnsafeArenaSetAllocatedToType(value *
 func (h *ResolvedExtendedCastElementProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(985, 36, buf, wasm2go.Inv_985_36)
+		module().enqueueFree(985, 36, buf, wasm2go.Inv_985_36)
 		h.ptr = 0
 	}
 }
@@ -216770,7 +216871,7 @@ func (h *ResolvedExtendedCastProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedExtendedCastProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(986, 17, buf, wasm2go.Inv_986_17)
+		module().enqueueFree(986, 17, buf, wasm2go.Inv_986_17)
 		h.ptr = 0
 	}
 }
@@ -217092,7 +217193,7 @@ func (h *ResolvedFilterField) SetResetClearedRequiredFields(v bool) error {
 func (h *ResolvedFilterField) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(987, 21, buf, wasm2go.Inv_987_21)
+		module().enqueueFree(987, 21, buf, wasm2go.Inv_987_21)
 		h.ptr = 0
 	}
 }
@@ -217367,7 +217468,7 @@ func (h *ResolvedFilterFieldArg) SetInclude(v bool) error {
 func (h *ResolvedFilterFieldArg) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(988, 19, buf, wasm2go.Inv_988_19)
+		module().enqueueFree(988, 19, buf, wasm2go.Inv_988_19)
 		h.ptr = 0
 	}
 }
@@ -217572,7 +217673,7 @@ func (h *ResolvedFilterFieldArgProto) UnsafeArenaSetAllocatedParent(value *Resol
 func (h *ResolvedFilterFieldArgProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(989, 21, buf, wasm2go.Inv_989_21)
+		module().enqueueFree(989, 21, buf, wasm2go.Inv_989_21)
 		h.ptr = 0
 	}
 }
@@ -217844,7 +217945,7 @@ func (h *ResolvedFilterFieldProto) UnsafeArenaSetAllocatedParent(value *Resolved
 func (h *ResolvedFilterFieldProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(990, 29, buf, wasm2go.Inv_990_29)
+		module().enqueueFree(990, 29, buf, wasm2go.Inv_990_29)
 		h.ptr = 0
 	}
 }
@@ -218042,7 +218143,7 @@ func (h *ResolvedFilterScan) SetInputScan(v ResolvedScanNode) error {
 func (h *ResolvedFilterScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(991, 16, buf, wasm2go.Inv_991_16)
+		module().enqueueFree(991, 16, buf, wasm2go.Inv_991_16)
 		h.ptr = 0
 	}
 }
@@ -218304,7 +218405,7 @@ func (h *ResolvedFilterScanProto) UnsafeArenaSetAllocatedParent(value *ResolvedS
 func (h *ResolvedFilterScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(992, 28, buf, wasm2go.Inv_992_28)
+		module().enqueueFree(992, 28, buf, wasm2go.Inv_992_28)
 		h.ptr = 0
 	}
 }
@@ -218497,7 +218598,7 @@ func (h *ResolvedFilterUsingAction) SetPredicateStr(v string) error {
 func (h *ResolvedFilterUsingAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(993, 15, buf, wasm2go.Inv_993_15)
+		module().enqueueFree(993, 15, buf, wasm2go.Inv_993_15)
 		h.ptr = 0
 	}
 }
@@ -218744,7 +218845,7 @@ func (h *ResolvedFilterUsingActionProto) UnsafeArenaSetAllocatedPredicate(value 
 func (h *ResolvedFilterUsingActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(994, 26, buf, wasm2go.Inv_994_26)
+		module().enqueueFree(994, 26, buf, wasm2go.Inv_994_26)
 		h.ptr = 0
 	}
 }
@@ -219028,7 +219129,7 @@ func (h *ResolvedFlatten) SetGetFieldList(v []ResolvedExprNode) error {
 func (h *ResolvedFlatten) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(995, 19, buf, wasm2go.Inv_995_19)
+		module().enqueueFree(995, 19, buf, wasm2go.Inv_995_19)
 		h.ptr = 0
 	}
 }
@@ -219268,7 +219369,7 @@ func (h *ResolvedFlattenProto) UnsafeArenaSetAllocatedParent(value *ResolvedExpr
 func (h *ResolvedFlattenProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(996, 25, buf, wasm2go.Inv_996_25)
+		module().enqueueFree(996, 25, buf, wasm2go.Inv_996_25)
 		h.ptr = 0
 	}
 }
@@ -219330,7 +219431,7 @@ func (h *ResolvedFlattenedArg) NodeKindString() (string, error) {
 func (h *ResolvedFlattenedArg) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(997, 4, buf, wasm2go.Inv_997_4)
+		module().enqueueFree(997, 4, buf, wasm2go.Inv_997_4)
 		h.ptr = 0
 	}
 }
@@ -219458,7 +219559,7 @@ func (h *ResolvedFlattenedArgProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedFlattenedArgProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(998, 12, buf, wasm2go.Inv_998_12)
+		module().enqueueFree(998, 12, buf, wasm2go.Inv_998_12)
 		h.ptr = 0
 	}
 }
@@ -220163,7 +220264,7 @@ func (h *ResolvedForeignKey) UpdateAction() (ResolvedForeignKeyEnums_ActionOpera
 func (h *ResolvedForeignKey) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(999, 49, buf, wasm2go.Inv_999_49)
+		module().enqueueFree(999, 49, buf, wasm2go.Inv_999_49)
 		h.ptr = 0
 	}
 }
@@ -220690,7 +220791,7 @@ func (h *ResolvedForeignKeyProto) UpdateAction() (ResolvedForeignKeyEnums_Action
 func (h *ResolvedForeignKeyProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1000, 60, buf, wasm2go.Inv_1000_60)
+		module().enqueueFree(1000, 60, buf, wasm2go.Inv_1000_60)
 		h.ptr = 0
 	}
 }
@@ -221221,7 +221322,7 @@ func (h *ResolvedFunctionArgument) SetSequence(v *ResolvedSequence) error {
 func (h *ResolvedFunctionArgument) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1001, 42, buf, wasm2go.Inv_1001_42)
+		module().enqueueFree(1001, 42, buf, wasm2go.Inv_1001_42)
 		h.ptr = 0
 	}
 }
@@ -221982,7 +222083,7 @@ func (h *ResolvedFunctionArgumentProto) UnsafeArenaSetAllocatedSequence(value *R
 func (h *ResolvedFunctionArgumentProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1002, 87, buf, wasm2go.Inv_1002_87)
+		module().enqueueFree(1002, 87, buf, wasm2go.Inv_1002_87)
 		h.ptr = 0
 	}
 }
@@ -222153,7 +222254,7 @@ func (h *ResolvedFunctionCall) SetFunctionCallInfo(v *ResolvedFunctionCallInfo) 
 func (h *ResolvedFunctionCall) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1003, 12, buf, wasm2go.Inv_1003_12)
+		module().enqueueFree(1003, 12, buf, wasm2go.Inv_1003_12)
 		h.ptr = 0
 	}
 }
@@ -222760,7 +222861,7 @@ func (h *ResolvedFunctionCallBase) Signature() (*FunctionSignature, error) {
 func (h *ResolvedFunctionCallBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1004, 39, buf, wasm2go.Inv_1004_39)
+		module().enqueueFree(1004, 39, buf, wasm2go.Inv_1004_39)
 		h.ptr = 0
 	}
 }
@@ -223234,7 +223335,7 @@ func (h *ResolvedFunctionCallBaseProto) UnsafeArenaSetAllocatedSignature(value *
 func (h *ResolvedFunctionCallBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1005, 52, buf, wasm2go.Inv_1005_52)
+		module().enqueueFree(1005, 52, buf, wasm2go.Inv_1005_52)
 		h.ptr = 0
 	}
 }
@@ -223295,7 +223396,7 @@ func (h *ResolvedFunctionCallInfo) DebugString() (string, error) {
 func (h *ResolvedFunctionCallInfo) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1006, 2, buf, wasm2go.Inv_1006_2)
+		module().enqueueFree(1006, 2, buf, wasm2go.Inv_1006_2)
 		h.ptr = 0
 	}
 }
@@ -223370,7 +223471,7 @@ func (h *ResolvedFunctionCallInfoProto) UnsafeArenaSwap(other *ResolvedFunctionC
 func (h *ResolvedFunctionCallInfoProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1007, 6, buf, wasm2go.Inv_1007_6)
+		module().enqueueFree(1007, 6, buf, wasm2go.Inv_1007_6)
 		h.ptr = 0
 	}
 }
@@ -223565,7 +223666,7 @@ func (h *ResolvedFunctionCallProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedFunctionCallProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1008, 20, buf, wasm2go.Inv_1008_20)
+		module().enqueueFree(1008, 20, buf, wasm2go.Inv_1008_20)
 		h.ptr = 0
 	}
 }
@@ -223724,7 +223825,7 @@ func (h *ResolvedFunctionSignatureHolder) Signature() (*FunctionSignature, error
 func (h *ResolvedFunctionSignatureHolder) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1009, 12, buf, wasm2go.Inv_1009_12)
+		module().enqueueFree(1009, 12, buf, wasm2go.Inv_1009_12)
 		h.ptr = 0
 	}
 }
@@ -223919,7 +224020,7 @@ func (h *ResolvedFunctionSignatureHolderProto) UnsafeArenaSetAllocatedSignature(
 func (h *ResolvedFunctionSignatureHolderProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1010, 20, buf, wasm2go.Inv_1010_20)
+		module().enqueueFree(1010, 20, buf, wasm2go.Inv_1010_20)
 		h.ptr = 0
 	}
 }
@@ -224142,7 +224243,7 @@ func (h *ResolvedGeneralizedQueryStmt) SetQuery(v ResolvedScanNode) error {
 func (h *ResolvedGeneralizedQueryStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1011, 16, buf, wasm2go.Inv_1011_16)
+		module().enqueueFree(1011, 16, buf, wasm2go.Inv_1011_16)
 		h.ptr = 0
 	}
 }
@@ -224404,7 +224505,7 @@ func (h *ResolvedGeneralizedQueryStmtProto) UnsafeArenaSetAllocatedQuery(value *
 func (h *ResolvedGeneralizedQueryStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1012, 28, buf, wasm2go.Inv_1012_28)
+		module().enqueueFree(1012, 28, buf, wasm2go.Inv_1012_28)
 		h.ptr = 0
 	}
 }
@@ -224610,7 +224711,7 @@ func (h *ResolvedGeneralizedQuerySubpipeline) Subpipeline() (*ResolvedSubpipelin
 func (h *ResolvedGeneralizedQuerySubpipeline) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1013, 16, buf, wasm2go.Inv_1013_16)
+		module().enqueueFree(1013, 16, buf, wasm2go.Inv_1013_16)
 		h.ptr = 0
 	}
 }
@@ -224872,7 +224973,7 @@ func (h *ResolvedGeneralizedQuerySubpipelineProto) UnsafeArenaSetAllocatedSubpip
 func (h *ResolvedGeneralizedQuerySubpipelineProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1014, 28, buf, wasm2go.Inv_1014_28)
+		module().enqueueFree(1014, 28, buf, wasm2go.Inv_1014_28)
 		h.ptr = 0
 	}
 }
@@ -225099,7 +225200,7 @@ func (h *ResolvedGeneratedColumnInfo) StoredMode() (ResolvedGeneratedColumnInfoE
 func (h *ResolvedGeneratedColumnInfo) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1015, 20, buf, wasm2go.Inv_1015_20)
+		module().enqueueFree(1015, 20, buf, wasm2go.Inv_1015_20)
 		h.ptr = 0
 	}
 }
@@ -225425,7 +225526,7 @@ func (h *ResolvedGeneratedColumnInfoProto) UnsafeArenaSetAllocatedParent(value *
 func (h *ResolvedGeneratedColumnInfoProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1016, 36, buf, wasm2go.Inv_1016_36)
+		module().enqueueFree(1016, 36, buf, wasm2go.Inv_1016_36)
 		h.ptr = 0
 	}
 }
@@ -225614,7 +225715,7 @@ func (h *ResolvedGetJsonField) SetFieldName(v string) error {
 func (h *ResolvedGetJsonField) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1017, 15, buf, wasm2go.Inv_1017_15)
+		module().enqueueFree(1017, 15, buf, wasm2go.Inv_1017_15)
 		h.ptr = 0
 	}
 }
@@ -225861,7 +225962,7 @@ func (h *ResolvedGetJsonFieldProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedGetJsonFieldProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1018, 26, buf, wasm2go.Inv_1018_26)
+		module().enqueueFree(1018, 26, buf, wasm2go.Inv_1018_26)
 		h.ptr = 0
 	}
 }
@@ -226152,7 +226253,7 @@ func (h *ResolvedGetProtoField) SetReturnDefaultValueWhenUnset(v bool) error {
 func (h *ResolvedGetProtoField) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1019, 21, buf, wasm2go.Inv_1019_21)
+		module().enqueueFree(1019, 21, buf, wasm2go.Inv_1019_21)
 		h.ptr = 0
 	}
 }
@@ -226577,7 +226678,7 @@ func (h *ResolvedGetProtoFieldProto) UnsafeArenaSetAllocatedParent(value *Resolv
 func (h *ResolvedGetProtoFieldProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1020, 48, buf, wasm2go.Inv_1020_48)
+		module().enqueueFree(1020, 48, buf, wasm2go.Inv_1020_48)
 		h.ptr = 0
 	}
 }
@@ -226776,7 +226877,7 @@ func (h *ResolvedGetProtoOneof) SetOneofDescriptor(v *OneofDescriptor) error {
 func (h *ResolvedGetProtoOneof) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1021, 15, buf, wasm2go.Inv_1021_15)
+		module().enqueueFree(1021, 15, buf, wasm2go.Inv_1021_15)
 		h.ptr = 0
 	}
 }
@@ -227038,7 +227139,7 @@ func (h *ResolvedGetProtoOneofProto) UnsafeArenaSetAllocatedParent(value *Resolv
 func (h *ResolvedGetProtoOneofProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1022, 28, buf, wasm2go.Inv_1022_28)
+		module().enqueueFree(1022, 28, buf, wasm2go.Inv_1022_28)
 		h.ptr = 0
 	}
 }
@@ -227228,7 +227329,7 @@ func (h *ResolvedGetRowField) SetExpr(v ResolvedExprNode) error {
 func (h *ResolvedGetRowField) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1023, 15, buf, wasm2go.Inv_1023_15)
+		module().enqueueFree(1023, 15, buf, wasm2go.Inv_1023_15)
 		h.ptr = 0
 	}
 }
@@ -227490,7 +227591,7 @@ func (h *ResolvedGetRowFieldProto) UnsafeArenaSetAllocatedParent(value *Resolved
 func (h *ResolvedGetRowFieldProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1024, 28, buf, wasm2go.Inv_1024_28)
+		module().enqueueFree(1024, 28, buf, wasm2go.Inv_1024_28)
 		h.ptr = 0
 	}
 }
@@ -227699,7 +227800,7 @@ func (h *ResolvedGetStructField) SetFieldIdx(v int32) error {
 func (h *ResolvedGetStructField) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1025, 17, buf, wasm2go.Inv_1025_17)
+		module().enqueueFree(1025, 17, buf, wasm2go.Inv_1025_17)
 		h.ptr = 0
 	}
 }
@@ -227949,7 +228050,7 @@ func (h *ResolvedGetStructFieldProto) UnsafeArenaSetAllocatedParent(value *Resol
 func (h *ResolvedGetStructFieldProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1026, 27, buf, wasm2go.Inv_1026_27)
+		module().enqueueFree(1026, 27, buf, wasm2go.Inv_1026_27)
 		h.ptr = 0
 	}
 }
@@ -228571,7 +228672,7 @@ func (h *ResolvedGrantOrRevokeStmt) SetPrivilegeList(v []*ResolvedPrivilege) err
 func (h *ResolvedGrantOrRevokeStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1027, 42, buf, wasm2go.Inv_1027_42)
+		module().enqueueFree(1027, 42, buf, wasm2go.Inv_1027_42)
 		h.ptr = 0
 	}
 }
@@ -228924,7 +229025,7 @@ func (h *ResolvedGrantOrRevokeStmtProto) UnsafeArenaSetAllocatedParent(value *Re
 func (h *ResolvedGrantOrRevokeStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1028, 37, buf, wasm2go.Inv_1028_37)
+		module().enqueueFree(1028, 37, buf, wasm2go.Inv_1028_37)
 		h.ptr = 0
 	}
 }
@@ -228985,7 +229086,7 @@ func (h *ResolvedGrantStmt) NodeKindString() (string, error) {
 func (h *ResolvedGrantStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1029, 4, buf, wasm2go.Inv_1029_4)
+		module().enqueueFree(1029, 4, buf, wasm2go.Inv_1029_4)
 		h.ptr = 0
 	}
 }
@@ -229113,7 +229214,7 @@ func (h *ResolvedGrantStmtProto) UnsafeArenaSetAllocatedParent(value *ResolvedGr
 func (h *ResolvedGrantStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1030, 12, buf, wasm2go.Inv_1030_12)
+		module().enqueueFree(1030, 12, buf, wasm2go.Inv_1030_12)
 		h.ptr = 0
 	}
 }
@@ -229355,7 +229456,7 @@ func (h *ResolvedGrantToAction) SetGranteeExprList(v []ResolvedExprNode) error {
 func (h *ResolvedGrantToAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1031, 16, buf, wasm2go.Inv_1031_16)
+		module().enqueueFree(1031, 16, buf, wasm2go.Inv_1031_16)
 		h.ptr = 0
 	}
 }
@@ -229528,7 +229629,7 @@ func (h *ResolvedGrantToActionProto) UnsafeArenaSetAllocatedParent(value *Resolv
 func (h *ResolvedGrantToActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1032, 17, buf, wasm2go.Inv_1032_17)
+		module().enqueueFree(1032, 17, buf, wasm2go.Inv_1032_17)
 		h.ptr = 0
 	}
 }
@@ -229850,7 +229951,7 @@ func (h *ResolvedGraphCallScan) Subquery() (ResolvedScanNode, error) {
 func (h *ResolvedGraphCallScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1033, 24, buf, wasm2go.Inv_1033_24)
+		module().enqueueFree(1033, 24, buf, wasm2go.Inv_1033_24)
 		h.ptr = 0
 	}
 }
@@ -230189,7 +230290,7 @@ func (h *ResolvedGraphCallScanProto) UnsafeArenaSetAllocatedSubquery(value *AnyR
 func (h *ResolvedGraphCallScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1034, 37, buf, wasm2go.Inv_1034_37)
+		module().enqueueFree(1034, 37, buf, wasm2go.Inv_1034_37)
 		h.ptr = 0
 	}
 }
@@ -230364,7 +230465,7 @@ func (h *ResolvedGraphDynamicLabelSpecification) SetLabelExpr(v ResolvedExprNode
 func (h *ResolvedGraphDynamicLabelSpecification) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1035, 13, buf, wasm2go.Inv_1035_13)
+		module().enqueueFree(1035, 13, buf, wasm2go.Inv_1035_13)
 		h.ptr = 0
 	}
 }
@@ -230559,7 +230660,7 @@ func (h *ResolvedGraphDynamicLabelSpecificationProto) UnsafeArenaSetAllocatedPar
 func (h *ResolvedGraphDynamicLabelSpecificationProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1036, 20, buf, wasm2go.Inv_1036_20)
+		module().enqueueFree(1036, 20, buf, wasm2go.Inv_1036_20)
 		h.ptr = 0
 	}
 }
@@ -230731,7 +230832,7 @@ func (h *ResolvedGraphDynamicPropertiesSpecification) SetPropertyExpr(v Resolved
 func (h *ResolvedGraphDynamicPropertiesSpecification) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1037, 13, buf, wasm2go.Inv_1037_13)
+		module().enqueueFree(1037, 13, buf, wasm2go.Inv_1037_13)
 		h.ptr = 0
 	}
 }
@@ -230926,7 +231027,7 @@ func (h *ResolvedGraphDynamicPropertiesSpecificationProto) UnsafeArenaSetAllocat
 func (h *ResolvedGraphDynamicPropertiesSpecificationProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1038, 20, buf, wasm2go.Inv_1038_20)
+		module().enqueueFree(1038, 20, buf, wasm2go.Inv_1038_20)
 		h.ptr = 0
 	}
 }
@@ -231295,7 +231396,7 @@ func (h *ResolvedGraphEdgeScan) SetRhsHintList(v []*ResolvedOption) error {
 func (h *ResolvedGraphEdgeScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1039, 27, buf, wasm2go.Inv_1039_27)
+		module().enqueueFree(1039, 27, buf, wasm2go.Inv_1039_27)
 		h.ptr = 0
 	}
 }
@@ -231612,7 +231713,7 @@ func (h *ResolvedGraphEdgeScanProto) UnsafeArenaSetAllocatedParent(value *Resolv
 func (h *ResolvedGraphEdgeScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1040, 34, buf, wasm2go.Inv_1040_34)
+		module().enqueueFree(1040, 34, buf, wasm2go.Inv_1040_34)
 		h.ptr = 0
 	}
 }
@@ -231937,7 +232038,7 @@ func (h *ResolvedGraphElementIdentifier) SourceNodeIdentifier() (*ResolvedGraphE
 func (h *ResolvedGraphElementIdentifier) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1041, 24, buf, wasm2go.Inv_1041_24)
+		module().enqueueFree(1041, 24, buf, wasm2go.Inv_1041_24)
 		h.ptr = 0
 	}
 }
@@ -232311,7 +232412,7 @@ func (h *ResolvedGraphElementIdentifierProto) UnsafeArenaSetAllocatedSourceNodeI
 func (h *ResolvedGraphElementIdentifierProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1042, 41, buf, wasm2go.Inv_1042_41)
+		module().enqueueFree(1042, 41, buf, wasm2go.Inv_1042_41)
 		h.ptr = 0
 	}
 }
@@ -232646,7 +232747,7 @@ func (h *ResolvedGraphElementLabel) SetPropertyDeclarationNameList(v []string) e
 func (h *ResolvedGraphElementLabel) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1043, 25, buf, wasm2go.Inv_1043_25)
+		module().enqueueFree(1043, 25, buf, wasm2go.Inv_1043_25)
 		h.ptr = 0
 	}
 }
@@ -232916,7 +233017,7 @@ func (h *ResolvedGraphElementLabelProto) UnsafeArenaSetAllocatedParent(value *Re
 func (h *ResolvedGraphElementLabelProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1044, 28, buf, wasm2go.Inv_1044_28)
+		module().enqueueFree(1044, 28, buf, wasm2go.Inv_1044_28)
 		h.ptr = 0
 	}
 }
@@ -233110,7 +233211,7 @@ func (h *ResolvedGraphElementProperty) SetExpr(v ResolvedExprNode) error {
 func (h *ResolvedGraphElementProperty) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1045, 15, buf, wasm2go.Inv_1045_15)
+		module().enqueueFree(1045, 15, buf, wasm2go.Inv_1045_15)
 		h.ptr = 0
 	}
 }
@@ -233372,7 +233473,7 @@ func (h *ResolvedGraphElementPropertyProto) UnsafeArenaSetAllocatedParent(value 
 func (h *ResolvedGraphElementPropertyProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1046, 28, buf, wasm2go.Inv_1046_28)
+		module().enqueueFree(1046, 28, buf, wasm2go.Inv_1046_28)
 		h.ptr = 0
 	}
 }
@@ -233701,7 +233802,7 @@ func (h *ResolvedGraphElementScan) TargetElementTableListSize() (int32, error) {
 func (h *ResolvedGraphElementScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1047, 21, buf, wasm2go.Inv_1047_21)
+		module().enqueueFree(1047, 21, buf, wasm2go.Inv_1047_21)
 		h.ptr = 0
 	}
 }
@@ -234008,7 +234109,7 @@ func (h *ResolvedGraphElementScanProto) UnsafeArenaSetAllocatedParent(value *Res
 func (h *ResolvedGraphElementScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1048, 33, buf, wasm2go.Inv_1048_33)
+		module().enqueueFree(1048, 33, buf, wasm2go.Inv_1048_33)
 		h.ptr = 0
 	}
 }
@@ -234648,7 +234749,7 @@ func (h *ResolvedGraphElementTable) SourceNodeReference() (*ResolvedGraphNodeTab
 func (h *ResolvedGraphElementTable) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1049, 46, buf, wasm2go.Inv_1049_46)
+		module().enqueueFree(1049, 46, buf, wasm2go.Inv_1049_46)
 		h.ptr = 0
 	}
 }
@@ -235298,7 +235399,7 @@ func (h *ResolvedGraphElementTableProto) UnsafeArenaSetAllocatedSourceNodeRefere
 func (h *ResolvedGraphElementTableProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1050, 73, buf, wasm2go.Inv_1050_73)
+		module().enqueueFree(1050, 73, buf, wasm2go.Inv_1050_73)
 		h.ptr = 0
 	}
 }
@@ -235514,7 +235615,7 @@ func (h *ResolvedGraphGetElementProperty) SetPropertyName(v ResolvedExprNode) er
 func (h *ResolvedGraphGetElementProperty) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1051, 18, buf, wasm2go.Inv_1051_18)
+		module().enqueueFree(1051, 18, buf, wasm2go.Inv_1051_18)
 		h.ptr = 0
 	}
 }
@@ -235843,7 +235944,7 @@ func (h *ResolvedGraphGetElementPropertyProto) UnsafeArenaSetAllocatedPropertyNa
 func (h *ResolvedGraphGetElementPropertyProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1052, 36, buf, wasm2go.Inv_1052_36)
+		module().enqueueFree(1052, 36, buf, wasm2go.Inv_1052_36)
 		h.ptr = 0
 	}
 }
@@ -236068,7 +236169,7 @@ func (h *ResolvedGraphIsLabeledPredicate) SetLabelExpr(v ResolvedGraphLabelExprN
 func (h *ResolvedGraphIsLabeledPredicate) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1053, 18, buf, wasm2go.Inv_1053_18)
+		module().enqueueFree(1053, 18, buf, wasm2go.Inv_1053_18)
 		h.ptr = 0
 	}
 }
@@ -236362,7 +236463,7 @@ func (h *ResolvedGraphIsLabeledPredicateProto) UnsafeArenaSetAllocatedParent(val
 func (h *ResolvedGraphIsLabeledPredicateProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1054, 32, buf, wasm2go.Inv_1054_32)
+		module().enqueueFree(1054, 32, buf, wasm2go.Inv_1054_32)
 		h.ptr = 0
 	}
 }
@@ -236556,7 +236657,7 @@ func (h *ResolvedGraphLabel) SetLabelName(v ResolvedExprNode) error {
 func (h *ResolvedGraphLabel) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1055, 15, buf, wasm2go.Inv_1055_15)
+		module().enqueueFree(1055, 15, buf, wasm2go.Inv_1055_15)
 		h.ptr = 0
 	}
 }
@@ -236605,7 +236706,7 @@ func (h *ResolvedGraphLabelExpr) ChildrenAccept(visitor *ResolvedASTVisitor) err
 func (h *ResolvedGraphLabelExpr) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1056, 2, buf, wasm2go.Inv_1056_2)
+		module().enqueueFree(1056, 2, buf, wasm2go.Inv_1056_2)
 		h.ptr = 0
 	}
 }
@@ -236733,7 +236834,7 @@ func (h *ResolvedGraphLabelExprProto) UnsafeArenaSetAllocatedParent(value *Resol
 func (h *ResolvedGraphLabelExprProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1057, 12, buf, wasm2go.Inv_1057_12)
+		module().enqueueFree(1057, 12, buf, wasm2go.Inv_1057_12)
 		h.ptr = 0
 	}
 }
@@ -237012,7 +237113,7 @@ func (h *ResolvedGraphLabelNaryExpr) SetOperandList(v []ResolvedGraphLabelExprNo
 func (h *ResolvedGraphLabelNaryExpr) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1058, 19, buf, wasm2go.Inv_1058_19)
+		module().enqueueFree(1058, 19, buf, wasm2go.Inv_1058_19)
 		h.ptr = 0
 	}
 }
@@ -237217,7 +237318,7 @@ func (h *ResolvedGraphLabelNaryExprProto) UnsafeArenaSetAllocatedParent(value *R
 func (h *ResolvedGraphLabelNaryExprProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1059, 21, buf, wasm2go.Inv_1059_21)
+		module().enqueueFree(1059, 21, buf, wasm2go.Inv_1059_21)
 		h.ptr = 0
 	}
 }
@@ -237479,7 +237580,7 @@ func (h *ResolvedGraphLabelProto) UnsafeArenaSetAllocatedParent(value *ResolvedG
 func (h *ResolvedGraphLabelProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1060, 28, buf, wasm2go.Inv_1060_28)
+		module().enqueueFree(1060, 28, buf, wasm2go.Inv_1060_28)
 		h.ptr = 0
 	}
 }
@@ -237719,7 +237820,7 @@ func (h *ResolvedGraphLinearScan) SetScanList(v []ResolvedScanNode) error {
 func (h *ResolvedGraphLinearScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1061, 16, buf, wasm2go.Inv_1061_16)
+		module().enqueueFree(1061, 16, buf, wasm2go.Inv_1061_16)
 		h.ptr = 0
 	}
 }
@@ -237892,7 +237993,7 @@ func (h *ResolvedGraphLinearScanProto) UnsafeArenaSetAllocatedParent(value *Reso
 func (h *ResolvedGraphLinearScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1062, 17, buf, wasm2go.Inv_1062_17)
+		module().enqueueFree(1062, 17, buf, wasm2go.Inv_1062_17)
 		h.ptr = 0
 	}
 }
@@ -238083,7 +238184,7 @@ func (h *ResolvedGraphMakeArrayVariable) SetElement(v *ResolvedColumn) error {
 func (h *ResolvedGraphMakeArrayVariable) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1063, 14, buf, wasm2go.Inv_1063_14)
+		module().enqueueFree(1063, 14, buf, wasm2go.Inv_1063_14)
 		h.ptr = 0
 	}
 }
@@ -238345,7 +238446,7 @@ func (h *ResolvedGraphMakeArrayVariableProto) UnsafeArenaSetAllocatedParent(valu
 func (h *ResolvedGraphMakeArrayVariableProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1064, 28, buf, wasm2go.Inv_1064_28)
+		module().enqueueFree(1064, 28, buf, wasm2go.Inv_1064_28)
 		h.ptr = 0
 	}
 }
@@ -238792,7 +238893,7 @@ func (h *ResolvedGraphMakeElement) SetPropertyList(v []*ResolvedGraphElementProp
 func (h *ResolvedGraphMakeElement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1065, 32, buf, wasm2go.Inv_1065_32)
+		module().enqueueFree(1065, 32, buf, wasm2go.Inv_1065_32)
 		h.ptr = 0
 	}
 }
@@ -239211,7 +239312,7 @@ func (h *ResolvedGraphMakeElementProto) UnsafeArenaSetAllocatedParent(value *Res
 func (h *ResolvedGraphMakeElementProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1066, 46, buf, wasm2go.Inv_1066_46)
+		module().enqueueFree(1066, 46, buf, wasm2go.Inv_1066_46)
 		h.ptr = 0
 	}
 }
@@ -239274,7 +239375,7 @@ func (h *ResolvedGraphNodeScan) NodeKindString() (string, error) {
 func (h *ResolvedGraphNodeScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1067, 4, buf, wasm2go.Inv_1067_4)
+		module().enqueueFree(1067, 4, buf, wasm2go.Inv_1067_4)
 		h.ptr = 0
 	}
 }
@@ -239402,7 +239503,7 @@ func (h *ResolvedGraphNodeScanProto) UnsafeArenaSetAllocatedParent(value *Resolv
 func (h *ResolvedGraphNodeScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1068, 12, buf, wasm2go.Inv_1068_12)
+		module().enqueueFree(1068, 12, buf, wasm2go.Inv_1068_12)
 		h.ptr = 0
 	}
 }
@@ -239774,7 +239875,7 @@ func (h *ResolvedGraphNodeTableReference) SetNodeTableIdentifier(v string) error
 func (h *ResolvedGraphNodeTableReference) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1069, 24, buf, wasm2go.Inv_1069_24)
+		module().enqueueFree(1069, 24, buf, wasm2go.Inv_1069_24)
 		h.ptr = 0
 	}
 }
@@ -240044,7 +240145,7 @@ func (h *ResolvedGraphNodeTableReferenceProto) UnsafeArenaSetAllocatedParent(val
 func (h *ResolvedGraphNodeTableReferenceProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1070, 28, buf, wasm2go.Inv_1070_28)
+		module().enqueueFree(1070, 28, buf, wasm2go.Inv_1070_28)
 		h.ptr = 0
 	}
 }
@@ -240206,7 +240307,7 @@ func (h *ResolvedGraphPathCost) SetCostSupertype(v Googlesql_TypeNode) error {
 func (h *ResolvedGraphPathCost) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1071, 12, buf, wasm2go.Inv_1071_12)
+		module().enqueueFree(1071, 12, buf, wasm2go.Inv_1071_12)
 		h.ptr = 0
 	}
 }
@@ -240401,7 +240502,7 @@ func (h *ResolvedGraphPathCostProto) UnsafeArenaSetAllocatedParent(value *Resolv
 func (h *ResolvedGraphPathCostProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1072, 20, buf, wasm2go.Inv_1072_20)
+		module().enqueueFree(1072, 20, buf, wasm2go.Inv_1072_20)
 		h.ptr = 0
 	}
 }
@@ -240562,7 +240663,7 @@ func (h *ResolvedGraphPathMode) SetPathMode(v ResolvedGraphPathModeEnums_PathMod
 func (h *ResolvedGraphPathMode) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1073, 12, buf, wasm2go.Inv_1073_12)
+		module().enqueueFree(1073, 12, buf, wasm2go.Inv_1073_12)
 		h.ptr = 0
 	}
 }
@@ -240722,7 +240823,7 @@ func (h *ResolvedGraphPathModeProto) UnsafeArenaSetAllocatedParent(value *Resolv
 func (h *ResolvedGraphPathModeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1074, 16, buf, wasm2go.Inv_1074_16)
+		module().enqueueFree(1074, 16, buf, wasm2go.Inv_1074_16)
 		h.ptr = 0
 	}
 }
@@ -240922,7 +241023,7 @@ func (h *ResolvedGraphPathPatternQuantifier) UpperBound() (ResolvedExprNode, err
 func (h *ResolvedGraphPathPatternQuantifier) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1075, 16, buf, wasm2go.Inv_1075_16)
+		module().enqueueFree(1075, 16, buf, wasm2go.Inv_1075_16)
 		h.ptr = 0
 	}
 }
@@ -241184,7 +241285,7 @@ func (h *ResolvedGraphPathPatternQuantifierProto) UpperBound() (*AnyResolvedExpr
 func (h *ResolvedGraphPathPatternQuantifierProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1076, 28, buf, wasm2go.Inv_1076_28)
+		module().enqueueFree(1076, 28, buf, wasm2go.Inv_1076_28)
 		h.ptr = 0
 	}
 }
@@ -241924,7 +242025,7 @@ func (h *ResolvedGraphPathScan) Tail() (*ResolvedColumn, error) {
 func (h *ResolvedGraphPathScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1077, 50, buf, wasm2go.Inv_1077_50)
+		module().enqueueFree(1077, 50, buf, wasm2go.Inv_1077_50)
 		h.ptr = 0
 	}
 }
@@ -241969,7 +242070,7 @@ func (h *ResolvedGraphPathScanBase) ChildrenAccept(visitor *ResolvedASTVisitor) 
 func (h *ResolvedGraphPathScanBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1078, 2, buf, wasm2go.Inv_1078_2)
+		module().enqueueFree(1078, 2, buf, wasm2go.Inv_1078_2)
 		h.ptr = 0
 	}
 }
@@ -242097,7 +242198,7 @@ func (h *ResolvedGraphPathScanBaseProto) UnsafeArenaSetAllocatedParent(value *Re
 func (h *ResolvedGraphPathScanBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1079, 12, buf, wasm2go.Inv_1079_12)
+		module().enqueueFree(1079, 12, buf, wasm2go.Inv_1079_12)
 		h.ptr = 0
 	}
 }
@@ -242896,7 +242997,7 @@ func (h *ResolvedGraphPathScanProto) UnsafeArenaSetAllocatedTail(value *Resolved
 func (h *ResolvedGraphPathScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1080, 91, buf, wasm2go.Inv_1080_91)
+		module().enqueueFree(1080, 91, buf, wasm2go.Inv_1080_91)
 		h.ptr = 0
 	}
 }
@@ -243089,7 +243190,7 @@ func (h *ResolvedGraphPathSearchPrefix) Type() (ResolvedGraphPathSearchPrefixEnu
 func (h *ResolvedGraphPathSearchPrefix) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1081, 15, buf, wasm2go.Inv_1081_15)
+		module().enqueueFree(1081, 15, buf, wasm2go.Inv_1081_15)
 		h.ptr = 0
 	}
 }
@@ -243316,7 +243417,7 @@ func (h *ResolvedGraphPathSearchPrefixProto) UnsafeArenaSetAllocatedPathCount(va
 func (h *ResolvedGraphPathSearchPrefixProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1082, 24, buf, wasm2go.Inv_1082_24)
+		module().enqueueFree(1082, 24, buf, wasm2go.Inv_1082_24)
 		h.ptr = 0
 	}
 }
@@ -243508,7 +243609,7 @@ func (h *ResolvedGraphPropertyDeclaration) TypeAnnotationMap() (*AnnotationMap, 
 func (h *ResolvedGraphPropertyDeclaration) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1083, 16, buf, wasm2go.Inv_1083_16)
+		module().enqueueFree(1083, 16, buf, wasm2go.Inv_1083_16)
 		h.ptr = 0
 	}
 }
@@ -243822,7 +243923,7 @@ func (h *ResolvedGraphPropertyDeclarationProto) UnsafeArenaSetAllocatedTypeAnnot
 func (h *ResolvedGraphPropertyDeclarationProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1084, 34, buf, wasm2go.Inv_1084_34)
+		module().enqueueFree(1084, 34, buf, wasm2go.Inv_1084_34)
 		h.ptr = 0
 	}
 }
@@ -244153,7 +244254,7 @@ func (h *ResolvedGraphPropertyDefinition) Sql() (string, error) {
 func (h *ResolvedGraphPropertyDefinition) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1085, 25, buf, wasm2go.Inv_1085_25)
+		module().enqueueFree(1085, 25, buf, wasm2go.Inv_1085_25)
 		h.ptr = 0
 	}
 }
@@ -244529,7 +244630,7 @@ func (h *ResolvedGraphPropertyDefinitionProto) UnsafeArenaSetAllocatedParent(val
 func (h *ResolvedGraphPropertyDefinitionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1086, 41, buf, wasm2go.Inv_1086_41)
+		module().enqueueFree(1086, 41, buf, wasm2go.Inv_1086_41)
 		h.ptr = 0
 	}
 }
@@ -244590,7 +244691,7 @@ func (h *ResolvedGraphRefScan) NodeKindString() (string, error) {
 func (h *ResolvedGraphRefScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1087, 4, buf, wasm2go.Inv_1087_4)
+		module().enqueueFree(1087, 4, buf, wasm2go.Inv_1087_4)
 		h.ptr = 0
 	}
 }
@@ -244718,7 +244819,7 @@ func (h *ResolvedGraphRefScanProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedGraphRefScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1088, 12, buf, wasm2go.Inv_1088_12)
+		module().enqueueFree(1088, 12, buf, wasm2go.Inv_1088_12)
 		h.ptr = 0
 	}
 }
@@ -245068,7 +245169,7 @@ func (h *ResolvedGraphScan) SetOptional(v bool) error {
 func (h *ResolvedGraphScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1089, 24, buf, wasm2go.Inv_1089_24)
+		module().enqueueFree(1089, 24, buf, wasm2go.Inv_1089_24)
 		h.ptr = 0
 	}
 }
@@ -245112,7 +245213,7 @@ func (h *ResolvedGraphScanBase) ChildrenAccept(visitor *ResolvedASTVisitor) erro
 func (h *ResolvedGraphScanBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1090, 2, buf, wasm2go.Inv_1090_2)
+		module().enqueueFree(1090, 2, buf, wasm2go.Inv_1090_2)
 		h.ptr = 0
 	}
 }
@@ -245240,7 +245341,7 @@ func (h *ResolvedGraphScanBaseProto) UnsafeArenaSetAllocatedParent(value *Resolv
 func (h *ResolvedGraphScanBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1091, 12, buf, wasm2go.Inv_1091_12)
+		module().enqueueFree(1091, 12, buf, wasm2go.Inv_1091_12)
 		h.ptr = 0
 	}
 }
@@ -245579,7 +245680,7 @@ func (h *ResolvedGraphScanProto) UnsafeArenaSetAllocatedParent(value *ResolvedGr
 func (h *ResolvedGraphScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1092, 37, buf, wasm2go.Inv_1092_37)
+		module().enqueueFree(1092, 37, buf, wasm2go.Inv_1092_37)
 		h.ptr = 0
 	}
 }
@@ -245877,7 +245978,7 @@ func (h *ResolvedGraphTableScan) ShapeExprListSize() (int32, error) {
 func (h *ResolvedGraphTableScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1093, 21, buf, wasm2go.Inv_1093_21)
+		module().enqueueFree(1093, 21, buf, wasm2go.Inv_1093_21)
 		h.ptr = 0
 	}
 }
@@ -246184,7 +246285,7 @@ func (h *ResolvedGraphTableScanProto) UnsafeArenaSetAllocatedPropertyGraph(value
 func (h *ResolvedGraphTableScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1094, 33, buf, wasm2go.Inv_1094_33)
+		module().enqueueFree(1094, 33, buf, wasm2go.Inv_1094_33)
 		h.ptr = 0
 	}
 }
@@ -246244,7 +246345,7 @@ func (h *ResolvedGraphWildCardLabel) NodeKindString() (string, error) {
 func (h *ResolvedGraphWildCardLabel) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1095, 4, buf, wasm2go.Inv_1095_4)
+		module().enqueueFree(1095, 4, buf, wasm2go.Inv_1095_4)
 		h.ptr = 0
 	}
 }
@@ -246372,7 +246473,7 @@ func (h *ResolvedGraphWildCardLabelProto) UnsafeArenaSetAllocatedParent(value *R
 func (h *ResolvedGraphWildCardLabelProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1096, 12, buf, wasm2go.Inv_1096_12)
+		module().enqueueFree(1096, 12, buf, wasm2go.Inv_1096_12)
 		h.ptr = 0
 	}
 }
@@ -246632,7 +246733,7 @@ func (h *ResolvedGroupRowsScan) SetInputColumnList(v []*ResolvedComputedColumn) 
 func (h *ResolvedGroupRowsScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1097, 18, buf, wasm2go.Inv_1097_18)
+		module().enqueueFree(1097, 18, buf, wasm2go.Inv_1097_18)
 		h.ptr = 0
 	}
 }
@@ -246857,7 +246958,7 @@ func (h *ResolvedGroupRowsScanProto) UnsafeArenaSetAllocatedParent(value *Resolv
 func (h *ResolvedGroupRowsScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1098, 23, buf, wasm2go.Inv_1098_23)
+		module().enqueueFree(1098, 23, buf, wasm2go.Inv_1098_23)
 		h.ptr = 0
 	}
 }
@@ -247047,7 +247148,7 @@ func (h *ResolvedGroupingCall) SetOutputColumn(v *ResolvedColumn) error {
 func (h *ResolvedGroupingCall) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1099, 15, buf, wasm2go.Inv_1099_15)
+		module().enqueueFree(1099, 15, buf, wasm2go.Inv_1099_15)
 		h.ptr = 0
 	}
 }
@@ -247309,7 +247410,7 @@ func (h *ResolvedGroupingCallProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedGroupingCallProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1100, 28, buf, wasm2go.Inv_1100_28)
+		module().enqueueFree(1100, 28, buf, wasm2go.Inv_1100_28)
 		h.ptr = 0
 	}
 }
@@ -247545,7 +247646,7 @@ func (h *ResolvedGroupingSet) SetGroupByColumnList(v []*ResolvedColumnRef) error
 func (h *ResolvedGroupingSet) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1101, 16, buf, wasm2go.Inv_1101_16)
+		module().enqueueFree(1101, 16, buf, wasm2go.Inv_1101_16)
 		h.ptr = 0
 	}
 }
@@ -247592,7 +247693,7 @@ func (h *ResolvedGroupingSetBase) ChildrenAccept(visitor *ResolvedASTVisitor) er
 func (h *ResolvedGroupingSetBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1102, 2, buf, wasm2go.Inv_1102_2)
+		module().enqueueFree(1102, 2, buf, wasm2go.Inv_1102_2)
 		h.ptr = 0
 	}
 }
@@ -247720,7 +247821,7 @@ func (h *ResolvedGroupingSetBaseProto) UnsafeArenaSetAllocatedParent(value *Reso
 func (h *ResolvedGroupingSetBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1103, 12, buf, wasm2go.Inv_1103_12)
+		module().enqueueFree(1103, 12, buf, wasm2go.Inv_1103_12)
 		h.ptr = 0
 	}
 }
@@ -247985,7 +248086,7 @@ func (h *ResolvedGroupingSetList) SetElemList(v []ResolvedGroupingSetBaseNode) e
 func (h *ResolvedGroupingSetList) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1104, 16, buf, wasm2go.Inv_1104_16)
+		module().enqueueFree(1104, 16, buf, wasm2go.Inv_1104_16)
 		h.ptr = 0
 	}
 }
@@ -248158,7 +248259,7 @@ func (h *ResolvedGroupingSetListProto) UnsafeArenaSetAllocatedParent(value *Reso
 func (h *ResolvedGroupingSetListProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1105, 17, buf, wasm2go.Inv_1105_17)
+		module().enqueueFree(1105, 17, buf, wasm2go.Inv_1105_17)
 		h.ptr = 0
 	}
 }
@@ -248396,7 +248497,7 @@ func (h *ResolvedGroupingSetMultiColumn) SetColumnList(v []*ResolvedColumnRef) e
 func (h *ResolvedGroupingSetMultiColumn) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1106, 16, buf, wasm2go.Inv_1106_16)
+		module().enqueueFree(1106, 16, buf, wasm2go.Inv_1106_16)
 		h.ptr = 0
 	}
 }
@@ -248569,7 +248670,7 @@ func (h *ResolvedGroupingSetMultiColumnProto) UnsafeArenaSetAllocatedParent(valu
 func (h *ResolvedGroupingSetMultiColumnProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1107, 17, buf, wasm2go.Inv_1107_17)
+		module().enqueueFree(1107, 17, buf, wasm2go.Inv_1107_17)
 		h.ptr = 0
 	}
 }
@@ -248846,7 +248947,7 @@ func (h *ResolvedGroupingSetProduct) SetInputList(v []ResolvedGroupingSetBaseNod
 func (h *ResolvedGroupingSetProduct) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1108, 16, buf, wasm2go.Inv_1108_16)
+		module().enqueueFree(1108, 16, buf, wasm2go.Inv_1108_16)
 		h.ptr = 0
 	}
 }
@@ -249019,7 +249120,7 @@ func (h *ResolvedGroupingSetProductProto) UnsafeArenaSetAllocatedParent(value *R
 func (h *ResolvedGroupingSetProductProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1109, 17, buf, wasm2go.Inv_1109_17)
+		module().enqueueFree(1109, 17, buf, wasm2go.Inv_1109_17)
 		h.ptr = 0
 	}
 }
@@ -249192,7 +249293,7 @@ func (h *ResolvedGroupingSetProto) UnsafeArenaSetAllocatedParent(value *Resolved
 func (h *ResolvedGroupingSetProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1110, 17, buf, wasm2go.Inv_1110_17)
+		module().enqueueFree(1110, 17, buf, wasm2go.Inv_1110_17)
 		h.ptr = 0
 	}
 }
@@ -249462,7 +249563,7 @@ func (h *ResolvedIdentityColumnInfo) StartWithValue() (*Value, error) {
 func (h *ResolvedIdentityColumnInfo) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1111, 20, buf, wasm2go.Inv_1111_20)
+		module().enqueueFree(1111, 20, buf, wasm2go.Inv_1111_20)
 		h.ptr = 0
 	}
 }
@@ -249890,7 +249991,7 @@ func (h *ResolvedIdentityColumnInfoProto) UnsafeArenaSetAllocatedStartWithValue(
 func (h *ResolvedIdentityColumnInfoProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1112, 48, buf, wasm2go.Inv_1112_48)
+		module().enqueueFree(1112, 48, buf, wasm2go.Inv_1112_48)
 		h.ptr = 0
 	}
 }
@@ -250499,7 +250600,7 @@ func (h *ResolvedImportStmt) SetOptionList(v []*ResolvedOption) error {
 func (h *ResolvedImportStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1113, 42, buf, wasm2go.Inv_1113_42)
+		module().enqueueFree(1113, 42, buf, wasm2go.Inv_1113_42)
 		h.ptr = 0
 	}
 }
@@ -250891,7 +250992,7 @@ func (h *ResolvedImportStmtProto) UnsafeArenaSetAllocatedParent(value *ResolvedS
 func (h *ResolvedImportStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1114, 42, buf, wasm2go.Inv_1114_42)
+		module().enqueueFree(1114, 42, buf, wasm2go.Inv_1114_42)
 		h.ptr = 0
 	}
 }
@@ -251171,7 +251272,7 @@ func (h *ResolvedIndexItem) SetOptionList(v []*ResolvedOption) error {
 func (h *ResolvedIndexItem) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1115, 21, buf, wasm2go.Inv_1115_21)
+		module().enqueueFree(1115, 21, buf, wasm2go.Inv_1115_21)
 		h.ptr = 0
 	}
 }
@@ -251443,7 +251544,7 @@ func (h *ResolvedIndexItemProto) UnsafeArenaSetAllocatedParent(value *ResolvedAr
 func (h *ResolvedIndexItemProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1116, 29, buf, wasm2go.Inv_1116_29)
+		module().enqueueFree(1116, 29, buf, wasm2go.Inv_1116_29)
 		h.ptr = 0
 	}
 }
@@ -251854,7 +251955,7 @@ func (h *ResolvedInlineLambda) SetParameterList(v []*ResolvedColumnRef) error {
 func (h *ResolvedInlineLambda) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1117, 26, buf, wasm2go.Inv_1117_26)
+		module().enqueueFree(1117, 26, buf, wasm2go.Inv_1117_26)
 		h.ptr = 0
 	}
 }
@@ -252139,7 +252240,7 @@ func (h *ResolvedInlineLambdaProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedInlineLambdaProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1118, 30, buf, wasm2go.Inv_1118_30)
+		module().enqueueFree(1118, 30, buf, wasm2go.Inv_1118_30)
 		h.ptr = 0
 	}
 }
@@ -252370,7 +252471,7 @@ func (h *ResolvedInsertRow) ValueListSize() (int32, error) {
 func (h *ResolvedInsertRow) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1119, 16, buf, wasm2go.Inv_1119_16)
+		module().enqueueFree(1119, 16, buf, wasm2go.Inv_1119_16)
 		h.ptr = 0
 	}
 }
@@ -252543,7 +252644,7 @@ func (h *ResolvedInsertRowProto) ValueListSize() (int32, error) {
 func (h *ResolvedInsertRowProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1120, 17, buf, wasm2go.Inv_1120_17)
+		module().enqueueFree(1120, 17, buf, wasm2go.Inv_1120_17)
 		h.ptr = 0
 	}
 }
@@ -253698,7 +253799,7 @@ func (h *ResolvedInsertStmt) TopologicallySortedGeneratedColumnIdListSize() (int
 func (h *ResolvedInsertStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1121, 74, buf, wasm2go.Inv_1121_74)
+		module().enqueueFree(1121, 74, buf, wasm2go.Inv_1121_74)
 		h.ptr = 0
 	}
 }
@@ -254490,7 +254591,7 @@ func (h *ResolvedInsertStmtProto) UnsafeArenaSetAllocatedTableScan(value *Resolv
 func (h *ResolvedInsertStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1122, 90, buf, wasm2go.Inv_1122_90)
+		module().enqueueFree(1122, 90, buf, wasm2go.Inv_1122_90)
 		h.ptr = 0
 	}
 }
@@ -254874,7 +254975,7 @@ func (h *ResolvedJoinScan) SetRightScan(v ResolvedScanNode) error {
 func (h *ResolvedJoinScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1123, 31, buf, wasm2go.Inv_1123_31)
+		module().enqueueFree(1123, 31, buf, wasm2go.Inv_1123_31)
 		h.ptr = 0
 	}
 }
@@ -255344,7 +255445,7 @@ func (h *ResolvedJoinScanProto) UnsafeArenaSetAllocatedRightScan(value *AnyResol
 func (h *ResolvedJoinScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1124, 53, buf, wasm2go.Inv_1124_53)
+		module().enqueueFree(1124, 53, buf, wasm2go.Inv_1124_53)
 		h.ptr = 0
 	}
 }
@@ -255584,7 +255685,7 @@ func (h *ResolvedLimitOffsetScan) SetOffset(v ResolvedExprNode) error {
 func (h *ResolvedLimitOffsetScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1125, 19, buf, wasm2go.Inv_1125_19)
+		module().enqueueFree(1125, 19, buf, wasm2go.Inv_1125_19)
 		h.ptr = 0
 	}
 }
@@ -255913,7 +256014,7 @@ func (h *ResolvedLimitOffsetScanProto) UnsafeArenaSetAllocatedParent(value *Reso
 func (h *ResolvedLimitOffsetScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1126, 36, buf, wasm2go.Inv_1126_36)
+		module().enqueueFree(1126, 36, buf, wasm2go.Inv_1126_36)
 		h.ptr = 0
 	}
 }
@@ -256135,7 +256236,7 @@ func (h *ResolvedLiteral) Value() (*Value, error) {
 func (h *ResolvedLiteral) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1127, 18, buf, wasm2go.Inv_1127_18)
+		module().enqueueFree(1127, 18, buf, wasm2go.Inv_1127_18)
 		h.ptr = 0
 	}
 }
@@ -256417,7 +256518,7 @@ func (h *ResolvedLiteralProto) Value() (*ValueWithTypeProto, error) {
 func (h *ResolvedLiteralProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1128, 31, buf, wasm2go.Inv_1128_31)
+		module().enqueueFree(1128, 31, buf, wasm2go.Inv_1128_31)
 		h.ptr = 0
 	}
 }
@@ -256578,7 +256679,7 @@ func (h *ResolvedLockMode) Strength() (ResolvedLockModeEnums_LockStrengthType, e
 func (h *ResolvedLockMode) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1129, 12, buf, wasm2go.Inv_1129_12)
+		module().enqueueFree(1129, 12, buf, wasm2go.Inv_1129_12)
 		h.ptr = 0
 	}
 }
@@ -256738,7 +256839,7 @@ func (h *ResolvedLockModeProto) UnsafeArenaSetAllocatedParent(value *ResolvedArg
 func (h *ResolvedLockModeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1130, 16, buf, wasm2go.Inv_1130_16)
+		module().enqueueFree(1130, 16, buf, wasm2go.Inv_1130_16)
 		h.ptr = 0
 	}
 }
@@ -256972,7 +257073,7 @@ func (h *ResolvedLogScan) Subpipeline() (*ResolvedSubpipeline, error) {
 func (h *ResolvedLogScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1131, 19, buf, wasm2go.Inv_1131_19)
+		module().enqueueFree(1131, 19, buf, wasm2go.Inv_1131_19)
 		h.ptr = 0
 	}
 }
@@ -257301,7 +257402,7 @@ func (h *ResolvedLogScanProto) UnsafeArenaSetAllocatedSubpipeline(value *Resolve
 func (h *ResolvedLogScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1132, 36, buf, wasm2go.Inv_1132_36)
+		module().enqueueFree(1132, 36, buf, wasm2go.Inv_1132_36)
 		h.ptr = 0
 	}
 }
@@ -257540,7 +257641,7 @@ func (h *ResolvedMakeProto) SetFieldList(v []*ResolvedMakeProtoField) error {
 func (h *ResolvedMakeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1133, 16, buf, wasm2go.Inv_1133_16)
+		module().enqueueFree(1133, 16, buf, wasm2go.Inv_1133_16)
 		h.ptr = 0
 	}
 }
@@ -257737,7 +257838,7 @@ func (h *ResolvedMakeProtoField) SetFieldDescriptor(v *FieldDescriptor) error {
 func (h *ResolvedMakeProtoField) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1134, 15, buf, wasm2go.Inv_1134_15)
+		module().enqueueFree(1134, 15, buf, wasm2go.Inv_1134_15)
 		h.ptr = 0
 	}
 }
@@ -258031,7 +258132,7 @@ func (h *ResolvedMakeProtoFieldProto) UnsafeArenaSetAllocatedParent(value *Resol
 func (h *ResolvedMakeProtoFieldProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1135, 32, buf, wasm2go.Inv_1135_32)
+		module().enqueueFree(1135, 32, buf, wasm2go.Inv_1135_32)
 		h.ptr = 0
 	}
 }
@@ -258204,7 +258305,7 @@ func (h *ResolvedMakeProtoProto) UnsafeArenaSetAllocatedParent(value *ResolvedEx
 func (h *ResolvedMakeProtoProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1136, 17, buf, wasm2go.Inv_1136_17)
+		module().enqueueFree(1136, 17, buf, wasm2go.Inv_1136_17)
 		h.ptr = 0
 	}
 }
@@ -258453,7 +258554,7 @@ func (h *ResolvedMakeStruct) SetFieldList(v []ResolvedExprNode) error {
 func (h *ResolvedMakeStruct) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1137, 16, buf, wasm2go.Inv_1137_16)
+		module().enqueueFree(1137, 16, buf, wasm2go.Inv_1137_16)
 		h.ptr = 0
 	}
 }
@@ -258626,7 +258727,7 @@ func (h *ResolvedMakeStructProto) UnsafeArenaSetAllocatedParent(value *ResolvedE
 func (h *ResolvedMakeStructProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1138, 17, buf, wasm2go.Inv_1138_17)
+		module().enqueueFree(1138, 17, buf, wasm2go.Inv_1138_17)
 		h.ptr = 0
 	}
 }
@@ -258788,7 +258889,7 @@ func (h *ResolvedMatchRecognizePatternAnchor) SetMode(v ResolvedMatchRecognizePa
 func (h *ResolvedMatchRecognizePatternAnchor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1139, 12, buf, wasm2go.Inv_1139_12)
+		module().enqueueFree(1139, 12, buf, wasm2go.Inv_1139_12)
 		h.ptr = 0
 	}
 }
@@ -258948,7 +259049,7 @@ func (h *ResolvedMatchRecognizePatternAnchorProto) UnsafeArenaSetAllocatedParent
 func (h *ResolvedMatchRecognizePatternAnchorProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1140, 16, buf, wasm2go.Inv_1140_16)
+		module().enqueueFree(1140, 16, buf, wasm2go.Inv_1140_16)
 		h.ptr = 0
 	}
 }
@@ -259011,7 +259112,7 @@ func (h *ResolvedMatchRecognizePatternEmpty) NodeKindString() (string, error) {
 func (h *ResolvedMatchRecognizePatternEmpty) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1141, 4, buf, wasm2go.Inv_1141_4)
+		module().enqueueFree(1141, 4, buf, wasm2go.Inv_1141_4)
 		h.ptr = 0
 	}
 }
@@ -259139,7 +259240,7 @@ func (h *ResolvedMatchRecognizePatternEmptyProto) UnsafeArenaSetAllocatedParent(
 func (h *ResolvedMatchRecognizePatternEmptyProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1142, 12, buf, wasm2go.Inv_1142_12)
+		module().enqueueFree(1142, 12, buf, wasm2go.Inv_1142_12)
 		h.ptr = 0
 	}
 }
@@ -259183,7 +259284,7 @@ func (h *ResolvedMatchRecognizePatternExpr) ChildrenAccept(visitor *ResolvedASTV
 func (h *ResolvedMatchRecognizePatternExpr) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1143, 2, buf, wasm2go.Inv_1143_2)
+		module().enqueueFree(1143, 2, buf, wasm2go.Inv_1143_2)
 		h.ptr = 0
 	}
 }
@@ -259311,7 +259412,7 @@ func (h *ResolvedMatchRecognizePatternExprProto) UnsafeArenaSetAllocatedParent(v
 func (h *ResolvedMatchRecognizePatternExprProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1144, 12, buf, wasm2go.Inv_1144_12)
+		module().enqueueFree(1144, 12, buf, wasm2go.Inv_1144_12)
 		h.ptr = 0
 	}
 }
@@ -259566,7 +259667,7 @@ func (h *ResolvedMatchRecognizePatternOperation) SetOperandList(v []ResolvedMatc
 func (h *ResolvedMatchRecognizePatternOperation) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1145, 18, buf, wasm2go.Inv_1145_18)
+		module().enqueueFree(1145, 18, buf, wasm2go.Inv_1145_18)
 		h.ptr = 0
 	}
 }
@@ -259771,7 +259872,7 @@ func (h *ResolvedMatchRecognizePatternOperationProto) UnsafeArenaSetAllocatedPar
 func (h *ResolvedMatchRecognizePatternOperationProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1146, 21, buf, wasm2go.Inv_1146_21)
+		module().enqueueFree(1146, 21, buf, wasm2go.Inv_1146_21)
 		h.ptr = 0
 	}
 }
@@ -260031,7 +260132,7 @@ func (h *ResolvedMatchRecognizePatternQuantification) UpperBound() (ResolvedExpr
 func (h *ResolvedMatchRecognizePatternQuantification) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1147, 21, buf, wasm2go.Inv_1147_21)
+		module().enqueueFree(1147, 21, buf, wasm2go.Inv_1147_21)
 		h.ptr = 0
 	}
 }
@@ -260392,7 +260493,7 @@ func (h *ResolvedMatchRecognizePatternQuantificationProto) UpperBound() (*AnyRes
 func (h *ResolvedMatchRecognizePatternQuantificationProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1148, 40, buf, wasm2go.Inv_1148_40)
+		module().enqueueFree(1148, 40, buf, wasm2go.Inv_1148_40)
 		h.ptr = 0
 	}
 }
@@ -260553,7 +260654,7 @@ func (h *ResolvedMatchRecognizePatternVariableRef) SetName(v string) error {
 func (h *ResolvedMatchRecognizePatternVariableRef) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1149, 12, buf, wasm2go.Inv_1149_12)
+		module().enqueueFree(1149, 12, buf, wasm2go.Inv_1149_12)
 		h.ptr = 0
 	}
 }
@@ -260733,7 +260834,7 @@ func (h *ResolvedMatchRecognizePatternVariableRefProto) UnsafeArenaSetAllocatedP
 func (h *ResolvedMatchRecognizePatternVariableRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1150, 18, buf, wasm2go.Inv_1150_18)
+		module().enqueueFree(1150, 18, buf, wasm2go.Inv_1150_18)
 		h.ptr = 0
 	}
 }
@@ -261425,7 +261526,7 @@ func (h *ResolvedMatchRecognizeScan) SetPatternVariableDefinitionList(v []*Resol
 func (h *ResolvedMatchRecognizeScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1151, 50, buf, wasm2go.Inv_1151_50)
+		module().enqueueFree(1151, 50, buf, wasm2go.Inv_1151_50)
 		h.ptr = 0
 	}
 }
@@ -262100,7 +262201,7 @@ func (h *ResolvedMatchRecognizeScanProto) UnsafeArenaSetAllocatedPattern(value *
 func (h *ResolvedMatchRecognizeScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1152, 76, buf, wasm2go.Inv_1152_76)
+		module().enqueueFree(1152, 76, buf, wasm2go.Inv_1152_76)
 		h.ptr = 0
 	}
 }
@@ -262293,7 +262394,7 @@ func (h *ResolvedMatchRecognizeVariableDefinition) SetPredicate(v ResolvedExprNo
 func (h *ResolvedMatchRecognizeVariableDefinition) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1153, 15, buf, wasm2go.Inv_1153_15)
+		module().enqueueFree(1153, 15, buf, wasm2go.Inv_1153_15)
 		h.ptr = 0
 	}
 }
@@ -262540,7 +262641,7 @@ func (h *ResolvedMatchRecognizeVariableDefinitionProto) UnsafeArenaSetAllocatedP
 func (h *ResolvedMatchRecognizeVariableDefinitionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1154, 26, buf, wasm2go.Inv_1154_26)
+		module().enqueueFree(1154, 26, buf, wasm2go.Inv_1154_26)
 		h.ptr = 0
 	}
 }
@@ -262830,7 +262931,7 @@ func (h *ResolvedMeasureGroup) SetPatternVariableRef(v *ResolvedMatchRecognizePa
 func (h *ResolvedMeasureGroup) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1155, 19, buf, wasm2go.Inv_1155_19)
+		module().enqueueFree(1155, 19, buf, wasm2go.Inv_1155_19)
 		h.ptr = 0
 	}
 }
@@ -263070,7 +263171,7 @@ func (h *ResolvedMeasureGroupProto) UnsafeArenaSetAllocatedPatternVariableRef(va
 func (h *ResolvedMeasureGroupProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1156, 25, buf, wasm2go.Inv_1156_25)
+		module().enqueueFree(1156, 25, buf, wasm2go.Inv_1156_25)
 		h.ptr = 0
 	}
 }
@@ -263533,7 +263634,7 @@ func (h *ResolvedMergeStmt) WhenClauseListSize() (int32, error) {
 func (h *ResolvedMergeStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1157, 32, buf, wasm2go.Inv_1157_32)
+		module().enqueueFree(1157, 32, buf, wasm2go.Inv_1157_32)
 		h.ptr = 0
 	}
 }
@@ -263948,7 +264049,7 @@ func (h *ResolvedMergeStmtProto) WhenClauseListSize() (int32, error) {
 func (h *ResolvedMergeStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1158, 46, buf, wasm2go.Inv_1158_46)
+		module().enqueueFree(1158, 46, buf, wasm2go.Inv_1158_46)
 		h.ptr = 0
 	}
 }
@@ -264533,7 +264634,7 @@ func (h *ResolvedMergeWhen) UpdateItemListSize() (int32, error) {
 func (h *ResolvedMergeWhen) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1159, 33, buf, wasm2go.Inv_1159_33)
+		module().enqueueFree(1159, 33, buf, wasm2go.Inv_1159_33)
 		h.ptr = 0
 	}
 }
@@ -264949,7 +265050,7 @@ func (h *ResolvedMergeWhenProto) UpdateItemListSize() (int32, error) {
 func (h *ResolvedMergeWhenProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1160, 46, buf, wasm2go.Inv_1160_46)
+		module().enqueueFree(1160, 46, buf, wasm2go.Inv_1160_46)
 		h.ptr = 0
 	}
 }
@@ -265112,7 +265213,7 @@ func (h *ResolvedModel) SetModel(v ModelNode) error {
 func (h *ResolvedModel) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1161, 12, buf, wasm2go.Inv_1161_12)
+		module().enqueueFree(1161, 12, buf, wasm2go.Inv_1161_12)
 		h.ptr = 0
 	}
 }
@@ -265307,7 +265408,7 @@ func (h *ResolvedModelProto) UnsafeArenaSetAllocatedParent(value *ResolvedArgume
 func (h *ResolvedModelProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1162, 20, buf, wasm2go.Inv_1162_20)
+		module().enqueueFree(1162, 20, buf, wasm2go.Inv_1162_20)
 		h.ptr = 0
 	}
 }
@@ -265639,7 +265740,7 @@ func (h *ResolvedModuleStmt) SetOptionList(v []*ResolvedOption) error {
 func (h *ResolvedModuleStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1163, 23, buf, wasm2go.Inv_1163_23)
+		module().enqueueFree(1163, 23, buf, wasm2go.Inv_1163_23)
 		h.ptr = 0
 	}
 }
@@ -265857,7 +265958,7 @@ func (h *ResolvedModuleStmtProto) UnsafeArenaSetAllocatedParent(value *ResolvedS
 func (h *ResolvedModuleStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1164, 22, buf, wasm2go.Inv_1164_22)
+		module().enqueueFree(1164, 22, buf, wasm2go.Inv_1164_22)
 		h.ptr = 0
 	}
 }
@@ -266115,7 +266216,7 @@ func (h *ResolvedMultiStmt) StatementListSize() (int32, error) {
 func (h *ResolvedMultiStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1165, 16, buf, wasm2go.Inv_1165_16)
+		module().enqueueFree(1165, 16, buf, wasm2go.Inv_1165_16)
 		h.ptr = 0
 	}
 }
@@ -266288,7 +266389,7 @@ func (h *ResolvedMultiStmtProto) UnsafeArenaSetAllocatedParent(value *ResolvedSt
 func (h *ResolvedMultiStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1166, 17, buf, wasm2go.Inv_1166_17)
+		module().enqueueFree(1166, 17, buf, wasm2go.Inv_1166_17)
 		h.ptr = 0
 	}
 }
@@ -266723,7 +266824,7 @@ func (h *ResolvedNodeBase) NodeKindString() (string, error) {
 func (h *ResolvedNodeBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1167, 25, buf, wasm2go.Inv_1167_25)
+		module().enqueueFree(1167, 25, buf, wasm2go.Inv_1167_25)
 		h.ptr = 0
 	}
 }
@@ -266880,7 +266981,7 @@ func (h *ResolvedNodeProto) UnsafeArenaSetAllocatedParseLocationRange(value *Par
 func (h *ResolvedNodeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1168, 16, buf, wasm2go.Inv_1168_16)
+		module().enqueueFree(1168, 16, buf, wasm2go.Inv_1168_16)
 		h.ptr = 0
 	}
 }
@@ -267075,7 +267176,7 @@ func (h *ResolvedNonScalarFunctionCallBase) WhereExpr() (ResolvedExprNode, error
 func (h *ResolvedNonScalarFunctionCallBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1169, 15, buf, wasm2go.Inv_1169_15)
+		module().enqueueFree(1169, 15, buf, wasm2go.Inv_1169_15)
 		h.ptr = 0
 	}
 }
@@ -267334,7 +267435,7 @@ func (h *ResolvedNonScalarFunctionCallBaseProto) WhereExpr() (*AnyResolvedExprPr
 func (h *ResolvedNonScalarFunctionCallBaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1170, 28, buf, wasm2go.Inv_1170_28)
+		module().enqueueFree(1170, 28, buf, wasm2go.Inv_1170_28)
 		h.ptr = 0
 	}
 }
@@ -267568,7 +267669,7 @@ func (h *ResolvedObjectUnit) SetNamePath(v []string) error {
 func (h *ResolvedObjectUnit) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1171, 17, buf, wasm2go.Inv_1171_17)
+		module().enqueueFree(1171, 17, buf, wasm2go.Inv_1171_17)
 		h.ptr = 0
 	}
 }
@@ -267741,7 +267842,7 @@ func (h *ResolvedObjectUnitProto) UnsafeArenaSetAllocatedParent(value *ResolvedA
 func (h *ResolvedObjectUnitProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1172, 17, buf, wasm2go.Inv_1172_17)
+		module().enqueueFree(1172, 17, buf, wasm2go.Inv_1172_17)
 		h.ptr = 0
 	}
 }
@@ -268232,7 +268333,7 @@ func (h *ResolvedOnConflictClause) UpdateWhereExpression() (ResolvedExprNode, er
 func (h *ResolvedOnConflictClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1173, 34, buf, wasm2go.Inv_1173_34)
+		module().enqueueFree(1173, 34, buf, wasm2go.Inv_1173_34)
 		h.ptr = 0
 	}
 }
@@ -268668,7 +268769,7 @@ func (h *ResolvedOnConflictClauseProto) UpdateWhereExpression() (*AnyResolvedExp
 func (h *ResolvedOnConflictClauseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1174, 48, buf, wasm2go.Inv_1174_48)
+		module().enqueueFree(1174, 48, buf, wasm2go.Inv_1174_48)
 		h.ptr = 0
 	}
 }
@@ -268950,7 +269051,7 @@ func (h *ResolvedOption) Value() (ResolvedExprNode, error) {
 func (h *ResolvedOption) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1175, 19, buf, wasm2go.Inv_1175_19)
+		module().enqueueFree(1175, 19, buf, wasm2go.Inv_1175_19)
 		h.ptr = 0
 	}
 }
@@ -269281,7 +269382,7 @@ func (h *ResolvedOptionProto) Value() (*AnyResolvedExprProto, error) {
 func (h *ResolvedOptionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1176, 36, buf, wasm2go.Inv_1176_36)
+		module().enqueueFree(1176, 36, buf, wasm2go.Inv_1176_36)
 		h.ptr = 0
 	}
 }
@@ -269567,7 +269668,7 @@ func (h *ResolvedOrderByItem) SetNullOrder(v ResolvedOrderByItemEnums_NullOrderM
 func (h *ResolvedOrderByItem) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1177, 22, buf, wasm2go.Inv_1177_22)
+		module().enqueueFree(1177, 22, buf, wasm2go.Inv_1177_22)
 		h.ptr = 0
 	}
 }
@@ -269960,7 +270061,7 @@ func (h *ResolvedOrderByItemProto) UnsafeArenaSetAllocatedParent(value *Resolved
 func (h *ResolvedOrderByItemProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1178, 44, buf, wasm2go.Inv_1178_44)
+		module().enqueueFree(1178, 44, buf, wasm2go.Inv_1178_44)
 		h.ptr = 0
 	}
 }
@@ -270250,7 +270351,7 @@ func (h *ResolvedOrderByScan) SetOrderByItemList(v []*ResolvedOrderByItem) error
 func (h *ResolvedOrderByScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1179, 19, buf, wasm2go.Inv_1179_19)
+		module().enqueueFree(1179, 19, buf, wasm2go.Inv_1179_19)
 		h.ptr = 0
 	}
 }
@@ -270490,7 +270591,7 @@ func (h *ResolvedOrderByScanProto) UnsafeArenaSetAllocatedParent(value *Resolved
 func (h *ResolvedOrderByScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1180, 25, buf, wasm2go.Inv_1180_25)
+		module().enqueueFree(1180, 25, buf, wasm2go.Inv_1180_25)
 		h.ptr = 0
 	}
 }
@@ -270667,7 +270768,7 @@ func (h *ResolvedOutputColumn) SetName(v string) error {
 func (h *ResolvedOutputColumn) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1181, 14, buf, wasm2go.Inv_1181_14)
+		module().enqueueFree(1181, 14, buf, wasm2go.Inv_1181_14)
 		h.ptr = 0
 	}
 }
@@ -270914,7 +271015,7 @@ func (h *ResolvedOutputColumnProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedOutputColumnProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1182, 26, buf, wasm2go.Inv_1182_26)
+		module().enqueueFree(1182, 26, buf, wasm2go.Inv_1182_26)
 		h.ptr = 0
 	}
 }
@@ -271178,7 +271279,7 @@ func (h *ResolvedOutputSchema) SetOutputColumnList(v []*ResolvedOutputColumn) er
 func (h *ResolvedOutputSchema) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1183, 18, buf, wasm2go.Inv_1183_18)
+		module().enqueueFree(1183, 18, buf, wasm2go.Inv_1183_18)
 		h.ptr = 0
 	}
 }
@@ -271383,7 +271484,7 @@ func (h *ResolvedOutputSchemaProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedOutputSchemaProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1184, 21, buf, wasm2go.Inv_1184_21)
+		module().enqueueFree(1184, 21, buf, wasm2go.Inv_1184_21)
 		h.ptr = 0
 	}
 }
@@ -271583,7 +271684,7 @@ func (h *ResolvedParameter) SetPosition(v int32) error {
 func (h *ResolvedParameter) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1185, 16, buf, wasm2go.Inv_1185_16)
+		module().enqueueFree(1185, 16, buf, wasm2go.Inv_1185_16)
 		h.ptr = 0
 	}
 }
@@ -271818,7 +271919,7 @@ func (h *ResolvedParameterProto) UnsafeArenaSetAllocatedParent(value *ResolvedEx
 func (h *ResolvedParameterProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1186, 25, buf, wasm2go.Inv_1186_25)
+		module().enqueueFree(1186, 25, buf, wasm2go.Inv_1186_25)
 		h.ptr = 0
 	}
 }
@@ -272004,7 +272105,7 @@ func (h *ResolvedPipeCreateTableScan) SetCreateTableAsSelectStmt(v *ResolvedCrea
 func (h *ResolvedPipeCreateTableScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1187, 13, buf, wasm2go.Inv_1187_13)
+		module().enqueueFree(1187, 13, buf, wasm2go.Inv_1187_13)
 		h.ptr = 0
 	}
 }
@@ -272199,7 +272300,7 @@ func (h *ResolvedPipeCreateTableScanProto) UnsafeArenaSetAllocatedParent(value *
 func (h *ResolvedPipeCreateTableScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1188, 20, buf, wasm2go.Inv_1188_20)
+		module().enqueueFree(1188, 20, buf, wasm2go.Inv_1188_20)
 		h.ptr = 0
 	}
 }
@@ -272374,7 +272475,7 @@ func (h *ResolvedPipeExportDataScan) SetExportDataStmt(v *ResolvedExportDataStmt
 func (h *ResolvedPipeExportDataScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1189, 13, buf, wasm2go.Inv_1189_13)
+		module().enqueueFree(1189, 13, buf, wasm2go.Inv_1189_13)
 		h.ptr = 0
 	}
 }
@@ -272569,7 +272670,7 @@ func (h *ResolvedPipeExportDataScanProto) UnsafeArenaSetAllocatedParent(value *R
 func (h *ResolvedPipeExportDataScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1190, 20, buf, wasm2go.Inv_1190_20)
+		module().enqueueFree(1190, 20, buf, wasm2go.Inv_1190_20)
 		h.ptr = 0
 	}
 }
@@ -272836,7 +272937,7 @@ func (h *ResolvedPipeForkScan) SubpipelineListSize() (int32, error) {
 func (h *ResolvedPipeForkScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1191, 19, buf, wasm2go.Inv_1191_19)
+		module().enqueueFree(1191, 19, buf, wasm2go.Inv_1191_19)
 		h.ptr = 0
 	}
 }
@@ -273076,7 +273177,7 @@ func (h *ResolvedPipeForkScanProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedPipeForkScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1192, 25, buf, wasm2go.Inv_1192_25)
+		module().enqueueFree(1192, 25, buf, wasm2go.Inv_1192_25)
 		h.ptr = 0
 	}
 }
@@ -273321,7 +273422,7 @@ func (h *ResolvedPipeIfCase) SubpipelineSql() (string, error) {
 func (h *ResolvedPipeIfCase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1193, 19, buf, wasm2go.Inv_1193_19)
+		module().enqueueFree(1193, 19, buf, wasm2go.Inv_1193_19)
 		h.ptr = 0
 	}
 }
@@ -273635,7 +273736,7 @@ func (h *ResolvedPipeIfCaseProto) UnsafeArenaSetAllocatedSubpipeline(value *Reso
 func (h *ResolvedPipeIfCaseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1194, 34, buf, wasm2go.Inv_1194_34)
+		module().enqueueFree(1194, 34, buf, wasm2go.Inv_1194_34)
 		h.ptr = 0
 	}
 }
@@ -273948,7 +274049,7 @@ func (h *ResolvedPipeIfScan) SetSelectedCase(v int32) error {
 func (h *ResolvedPipeIfScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1195, 22, buf, wasm2go.Inv_1195_22)
+		module().enqueueFree(1195, 22, buf, wasm2go.Inv_1195_22)
 		h.ptr = 0
 	}
 }
@@ -274211,7 +274312,7 @@ func (h *ResolvedPipeIfScanProto) UnsafeArenaSetAllocatedParent(value *ResolvedS
 func (h *ResolvedPipeIfScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1196, 28, buf, wasm2go.Inv_1196_28)
+		module().enqueueFree(1196, 28, buf, wasm2go.Inv_1196_28)
 		h.ptr = 0
 	}
 }
@@ -274386,7 +274487,7 @@ func (h *ResolvedPipeInsertScan) SetInsertStmt(v *ResolvedInsertStmt) error {
 func (h *ResolvedPipeInsertScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1197, 13, buf, wasm2go.Inv_1197_13)
+		module().enqueueFree(1197, 13, buf, wasm2go.Inv_1197_13)
 		h.ptr = 0
 	}
 }
@@ -274581,7 +274682,7 @@ func (h *ResolvedPipeInsertScanProto) UnsafeArenaSetAllocatedParent(value *Resol
 func (h *ResolvedPipeInsertScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1198, 20, buf, wasm2go.Inv_1198_20)
+		module().enqueueFree(1198, 20, buf, wasm2go.Inv_1198_20)
 		h.ptr = 0
 	}
 }
@@ -274848,7 +274949,7 @@ func (h *ResolvedPipeTeeScan) SubpipelineListSize() (int32, error) {
 func (h *ResolvedPipeTeeScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1199, 19, buf, wasm2go.Inv_1199_19)
+		module().enqueueFree(1199, 19, buf, wasm2go.Inv_1199_19)
 		h.ptr = 0
 	}
 }
@@ -275088,7 +275189,7 @@ func (h *ResolvedPipeTeeScanProto) UnsafeArenaSetAllocatedParent(value *Resolved
 func (h *ResolvedPipeTeeScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1200, 25, buf, wasm2go.Inv_1200_25)
+		module().enqueueFree(1200, 25, buf, wasm2go.Inv_1200_25)
 		h.ptr = 0
 	}
 }
@@ -275308,7 +275409,7 @@ func (h *ResolvedPivotColumn) SetPivotValueIndex(v int32) error {
 func (h *ResolvedPivotColumn) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1201, 16, buf, wasm2go.Inv_1201_16)
+		module().enqueueFree(1201, 16, buf, wasm2go.Inv_1201_16)
 		h.ptr = 0
 	}
 }
@@ -275549,7 +275650,7 @@ func (h *ResolvedPivotColumnProto) UnsafeArenaSetAllocatedParent(value *Resolved
 func (h *ResolvedPivotColumnProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1202, 26, buf, wasm2go.Inv_1202_26)
+		module().enqueueFree(1202, 26, buf, wasm2go.Inv_1202_26)
 		h.ptr = 0
 	}
 }
@@ -276179,7 +276280,7 @@ func (h *ResolvedPivotScan) SetPivotValueList(v []ResolvedExprNode) error {
 func (h *ResolvedPivotScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1203, 40, buf, wasm2go.Inv_1203_40)
+		module().enqueueFree(1203, 40, buf, wasm2go.Inv_1203_40)
 		h.ptr = 0
 	}
 }
@@ -276621,7 +276722,7 @@ func (h *ResolvedPivotScanProto) UnsafeArenaSetAllocatedParent(value *ResolvedSc
 func (h *ResolvedPivotScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1204, 48, buf, wasm2go.Inv_1204_48)
+		module().enqueueFree(1204, 48, buf, wasm2go.Inv_1204_48)
 		h.ptr = 0
 	}
 }
@@ -277101,7 +277202,7 @@ func (h *ResolvedPrimaryKey) Unenforced() (bool, error) {
 func (h *ResolvedPrimaryKey) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1205, 34, buf, wasm2go.Inv_1205_34)
+		module().enqueueFree(1205, 34, buf, wasm2go.Inv_1205_34)
 		h.ptr = 0
 	}
 }
@@ -277434,7 +277535,7 @@ func (h *ResolvedPrimaryKeyProto) UnsafeArenaSetAllocatedParent(value *ResolvedC
 func (h *ResolvedPrimaryKeyProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1206, 36, buf, wasm2go.Inv_1206_36)
+		module().enqueueFree(1206, 36, buf, wasm2go.Inv_1206_36)
 		h.ptr = 0
 	}
 }
@@ -277690,7 +277791,7 @@ func (h *ResolvedPrivilege) UnitListSize() (int32, error) {
 func (h *ResolvedPrivilege) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1207, 18, buf, wasm2go.Inv_1207_18)
+		module().enqueueFree(1207, 18, buf, wasm2go.Inv_1207_18)
 		h.ptr = 0
 	}
 }
@@ -277915,7 +278016,7 @@ func (h *ResolvedPrivilegeProto) UnsafeArenaSetAllocatedParent(value *ResolvedAr
 func (h *ResolvedPrivilegeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1208, 23, buf, wasm2go.Inv_1208_23)
+		module().enqueueFree(1208, 23, buf, wasm2go.Inv_1208_23)
 		h.ptr = 0
 	}
 }
@@ -278187,7 +278288,7 @@ func (h *ResolvedProjectScan) SetInputScan(v ResolvedScanNode, propagateOrder bo
 func (h *ResolvedProjectScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1209, 19, buf, wasm2go.Inv_1209_19)
+		module().enqueueFree(1209, 19, buf, wasm2go.Inv_1209_19)
 		h.ptr = 0
 	}
 }
@@ -278427,7 +278528,7 @@ func (h *ResolvedProjectScanProto) UnsafeArenaSetAllocatedParent(value *Resolved
 func (h *ResolvedProjectScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1210, 25, buf, wasm2go.Inv_1210_25)
+		module().enqueueFree(1210, 25, buf, wasm2go.Inv_1210_25)
 		h.ptr = 0
 	}
 }
@@ -278715,7 +278816,7 @@ func (h *ResolvedQueryStmt) SetQuery(v ResolvedScanNode) error {
 func (h *ResolvedQueryStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1211, 21, buf, wasm2go.Inv_1211_21)
+		module().enqueueFree(1211, 21, buf, wasm2go.Inv_1211_21)
 		h.ptr = 0
 	}
 }
@@ -278987,7 +279088,7 @@ func (h *ResolvedQueryStmtProto) UnsafeArenaSetAllocatedQuery(value *AnyResolved
 func (h *ResolvedQueryStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1212, 29, buf, wasm2go.Inv_1212_29)
+		module().enqueueFree(1212, 29, buf, wasm2go.Inv_1212_29)
 		h.ptr = 0
 	}
 }
@@ -279050,7 +279151,7 @@ func (h *ResolvedRebuildAction) NodeKindString() (string, error) {
 func (h *ResolvedRebuildAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1213, 4, buf, wasm2go.Inv_1213_4)
+		module().enqueueFree(1213, 4, buf, wasm2go.Inv_1213_4)
 		h.ptr = 0
 	}
 }
@@ -279178,7 +279279,7 @@ func (h *ResolvedRebuildActionProto) UnsafeArenaSetAllocatedParent(value *Resolv
 func (h *ResolvedRebuildActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1214, 12, buf, wasm2go.Inv_1214_12)
+		module().enqueueFree(1214, 12, buf, wasm2go.Inv_1214_12)
 		h.ptr = 0
 	}
 }
@@ -279436,7 +279537,7 @@ func (h *ResolvedRecursionDepthModifier) UpperBound() (ResolvedExprNode, error) 
 func (h *ResolvedRecursionDepthModifier) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1215, 19, buf, wasm2go.Inv_1215_19)
+		module().enqueueFree(1215, 19, buf, wasm2go.Inv_1215_19)
 		h.ptr = 0
 	}
 }
@@ -279765,7 +279866,7 @@ func (h *ResolvedRecursionDepthModifierProto) UpperBound() (*AnyResolvedExprProt
 func (h *ResolvedRecursionDepthModifierProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1216, 36, buf, wasm2go.Inv_1216_36)
+		module().enqueueFree(1216, 36, buf, wasm2go.Inv_1216_36)
 		h.ptr = 0
 	}
 }
@@ -279830,7 +279931,7 @@ func (h *ResolvedRecursiveRefScan) NodeKindString() (string, error) {
 func (h *ResolvedRecursiveRefScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1217, 4, buf, wasm2go.Inv_1217_4)
+		module().enqueueFree(1217, 4, buf, wasm2go.Inv_1217_4)
 		h.ptr = 0
 	}
 }
@@ -279958,7 +280059,7 @@ func (h *ResolvedRecursiveRefScanProto) UnsafeArenaSetAllocatedParent(value *Res
 func (h *ResolvedRecursiveRefScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1218, 12, buf, wasm2go.Inv_1218_12)
+		module().enqueueFree(1218, 12, buf, wasm2go.Inv_1218_12)
 		h.ptr = 0
 	}
 }
@@ -280271,7 +280372,7 @@ func (h *ResolvedRecursiveScan) SetRecursiveTerm(v *ResolvedSetOperationItem) er
 func (h *ResolvedRecursiveScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1219, 21, buf, wasm2go.Inv_1219_21)
+		module().enqueueFree(1219, 21, buf, wasm2go.Inv_1219_21)
 		h.ptr = 0
 	}
 }
@@ -280632,7 +280733,7 @@ func (h *ResolvedRecursiveScanProto) UnsafeArenaSetAllocatedRecursiveTerm(value 
 func (h *ResolvedRecursiveScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1220, 40, buf, wasm2go.Inv_1220_40)
+		module().enqueueFree(1220, 40, buf, wasm2go.Inv_1220_40)
 		h.ptr = 0
 	}
 }
@@ -280814,7 +280915,7 @@ func (h *ResolvedRelationArgumentScan) SetName(v string) error {
 func (h *ResolvedRelationArgumentScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1221, 14, buf, wasm2go.Inv_1221_14)
+		module().enqueueFree(1221, 14, buf, wasm2go.Inv_1221_14)
 		h.ptr = 0
 	}
 }
@@ -281026,7 +281127,7 @@ func (h *ResolvedRelationArgumentScanProto) UnsafeArenaSetAllocatedParent(value 
 func (h *ResolvedRelationArgumentScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1222, 22, buf, wasm2go.Inv_1222_22)
+		module().enqueueFree(1222, 22, buf, wasm2go.Inv_1222_22)
 		h.ptr = 0
 	}
 }
@@ -281292,7 +281393,7 @@ func (h *ResolvedRemoveFromRestricteeListAction) SetRestricteeList(v []ResolvedE
 func (h *ResolvedRemoveFromRestricteeListAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1223, 18, buf, wasm2go.Inv_1223_18)
+		module().enqueueFree(1223, 18, buf, wasm2go.Inv_1223_18)
 		h.ptr = 0
 	}
 }
@@ -281497,7 +281598,7 @@ func (h *ResolvedRemoveFromRestricteeListActionProto) UnsafeArenaSetAllocatedPar
 func (h *ResolvedRemoveFromRestricteeListActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1224, 21, buf, wasm2go.Inv_1224_21)
+		module().enqueueFree(1224, 21, buf, wasm2go.Inv_1224_21)
 		h.ptr = 0
 	}
 }
@@ -281701,7 +281802,7 @@ func (h *ResolvedRenameColumnAction) SetNewName(v string) error {
 func (h *ResolvedRenameColumnAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1225, 16, buf, wasm2go.Inv_1225_16)
+		module().enqueueFree(1225, 16, buf, wasm2go.Inv_1225_16)
 		h.ptr = 0
 	}
 }
@@ -281965,7 +282066,7 @@ func (h *ResolvedRenameColumnActionProto) UnsafeArenaSetAllocatedParent(value *R
 func (h *ResolvedRenameColumnActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1226, 28, buf, wasm2go.Inv_1226_28)
+		module().enqueueFree(1226, 28, buf, wasm2go.Inv_1226_28)
 		h.ptr = 0
 	}
 }
@@ -282322,7 +282423,7 @@ func (h *ResolvedRenameStmt) SetOldNamePath(v []string) error {
 func (h *ResolvedRenameStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1227, 26, buf, wasm2go.Inv_1227_26)
+		module().enqueueFree(1227, 26, buf, wasm2go.Inv_1227_26)
 		h.ptr = 0
 	}
 }
@@ -282592,7 +282693,7 @@ func (h *ResolvedRenameStmtProto) UnsafeArenaSetAllocatedParent(value *ResolvedS
 func (h *ResolvedRenameStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1228, 28, buf, wasm2go.Inv_1228_28)
+		module().enqueueFree(1228, 28, buf, wasm2go.Inv_1228_28)
 		h.ptr = 0
 	}
 }
@@ -282830,7 +282931,7 @@ func (h *ResolvedRenameToAction) SetNewPath(v []string) error {
 func (h *ResolvedRenameToAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1229, 17, buf, wasm2go.Inv_1229_17)
+		module().enqueueFree(1229, 17, buf, wasm2go.Inv_1229_17)
 		h.ptr = 0
 	}
 }
@@ -283003,7 +283104,7 @@ func (h *ResolvedRenameToActionProto) UnsafeArenaSetAllocatedParent(value *Resol
 func (h *ResolvedRenameToActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1230, 17, buf, wasm2go.Inv_1230_17)
+		module().enqueueFree(1230, 17, buf, wasm2go.Inv_1230_17)
 		h.ptr = 0
 	}
 }
@@ -283281,7 +283382,7 @@ func (h *ResolvedReplaceField) SetReplaceFieldItemList(v []*ResolvedReplaceField
 func (h *ResolvedReplaceField) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1231, 19, buf, wasm2go.Inv_1231_19)
+		module().enqueueFree(1231, 19, buf, wasm2go.Inv_1231_19)
 		h.ptr = 0
 	}
 }
@@ -283734,7 +283835,7 @@ func (h *ResolvedReplaceFieldItem) StructIndexPathSize() (int32, error) {
 func (h *ResolvedReplaceFieldItem) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1232, 27, buf, wasm2go.Inv_1232_27)
+		module().enqueueFree(1232, 27, buf, wasm2go.Inv_1232_27)
 		h.ptr = 0
 	}
 }
@@ -284005,7 +284106,7 @@ func (h *ResolvedReplaceFieldItemProto) UnsafeArenaSetAllocatedParent(value *Res
 func (h *ResolvedReplaceFieldItemProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1233, 29, buf, wasm2go.Inv_1233_29)
+		module().enqueueFree(1233, 29, buf, wasm2go.Inv_1233_29)
 		h.ptr = 0
 	}
 }
@@ -284245,7 +284346,7 @@ func (h *ResolvedReplaceFieldProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedReplaceFieldProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1234, 25, buf, wasm2go.Inv_1234_25)
+		module().enqueueFree(1234, 25, buf, wasm2go.Inv_1234_25)
 		h.ptr = 0
 	}
 }
@@ -284495,7 +284596,7 @@ func (h *ResolvedRestrictToAction) SetRestricteeList(v []ResolvedExprNode) error
 func (h *ResolvedRestrictToAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1235, 16, buf, wasm2go.Inv_1235_16)
+		module().enqueueFree(1235, 16, buf, wasm2go.Inv_1235_16)
 		h.ptr = 0
 	}
 }
@@ -284668,7 +284769,7 @@ func (h *ResolvedRestrictToActionProto) UnsafeArenaSetAllocatedParent(value *Res
 func (h *ResolvedRestrictToActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1236, 17, buf, wasm2go.Inv_1236_17)
+		module().enqueueFree(1236, 17, buf, wasm2go.Inv_1236_17)
 		h.ptr = 0
 	}
 }
@@ -285036,7 +285137,7 @@ func (h *ResolvedReturningClause) SetOutputColumnList(v []*ResolvedOutputColumn)
 func (h *ResolvedReturningClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1237, 25, buf, wasm2go.Inv_1237_25)
+		module().enqueueFree(1237, 25, buf, wasm2go.Inv_1237_25)
 		h.ptr = 0
 	}
 }
@@ -285321,7 +285422,7 @@ func (h *ResolvedReturningClauseProto) UnsafeArenaSetAllocatedParent(value *Reso
 func (h *ResolvedReturningClauseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1238, 30, buf, wasm2go.Inv_1238_30)
+		module().enqueueFree(1238, 30, buf, wasm2go.Inv_1238_30)
 		h.ptr = 0
 	}
 }
@@ -285584,7 +285685,7 @@ func (h *ResolvedRevokeFromAction) SetRevokeeExprList(v []ResolvedExprNode) erro
 func (h *ResolvedRevokeFromAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1239, 18, buf, wasm2go.Inv_1239_18)
+		module().enqueueFree(1239, 18, buf, wasm2go.Inv_1239_18)
 		h.ptr = 0
 	}
 }
@@ -285789,7 +285890,7 @@ func (h *ResolvedRevokeFromActionProto) UnsafeArenaSetAllocatedParent(value *Res
 func (h *ResolvedRevokeFromActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1240, 21, buf, wasm2go.Inv_1240_21)
+		module().enqueueFree(1240, 21, buf, wasm2go.Inv_1240_21)
 		h.ptr = 0
 	}
 }
@@ -285850,7 +285951,7 @@ func (h *ResolvedRevokeStmt) NodeKindString() (string, error) {
 func (h *ResolvedRevokeStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1241, 4, buf, wasm2go.Inv_1241_4)
+		module().enqueueFree(1241, 4, buf, wasm2go.Inv_1241_4)
 		h.ptr = 0
 	}
 }
@@ -285978,7 +286079,7 @@ func (h *ResolvedRevokeStmtProto) UnsafeArenaSetAllocatedParent(value *ResolvedG
 func (h *ResolvedRevokeStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1242, 12, buf, wasm2go.Inv_1242_12)
+		module().enqueueFree(1242, 12, buf, wasm2go.Inv_1242_12)
 		h.ptr = 0
 	}
 }
@@ -286038,7 +286139,7 @@ func (h *ResolvedRollbackStmt) NodeKindString() (string, error) {
 func (h *ResolvedRollbackStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1243, 4, buf, wasm2go.Inv_1243_4)
+		module().enqueueFree(1243, 4, buf, wasm2go.Inv_1243_4)
 		h.ptr = 0
 	}
 }
@@ -286166,7 +286267,7 @@ func (h *ResolvedRollbackStmtProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedRollbackStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1244, 12, buf, wasm2go.Inv_1244_12)
+		module().enqueueFree(1244, 12, buf, wasm2go.Inv_1244_12)
 		h.ptr = 0
 	}
 }
@@ -286407,7 +286508,7 @@ func (h *ResolvedRollup) SetRollupColumnList(v []*ResolvedGroupingSetMultiColumn
 func (h *ResolvedRollup) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1245, 16, buf, wasm2go.Inv_1245_16)
+		module().enqueueFree(1245, 16, buf, wasm2go.Inv_1245_16)
 		h.ptr = 0
 	}
 }
@@ -286580,7 +286681,7 @@ func (h *ResolvedRollupProto) UnsafeArenaSetAllocatedParent(value *ResolvedGroup
 func (h *ResolvedRollupProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1246, 17, buf, wasm2go.Inv_1246_17)
+		module().enqueueFree(1246, 17, buf, wasm2go.Inv_1246_17)
 		h.ptr = 0
 	}
 }
@@ -286640,7 +286741,7 @@ func (h *ResolvedRunBatchStmt) NodeKindString() (string, error) {
 func (h *ResolvedRunBatchStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1247, 4, buf, wasm2go.Inv_1247_4)
+		module().enqueueFree(1247, 4, buf, wasm2go.Inv_1247_4)
 		h.ptr = 0
 	}
 }
@@ -286768,7 +286869,7 @@ func (h *ResolvedRunBatchStmtProto) UnsafeArenaSetAllocatedParent(value *Resolve
 func (h *ResolvedRunBatchStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1248, 12, buf, wasm2go.Inv_1248_12)
+		module().enqueueFree(1248, 12, buf, wasm2go.Inv_1248_12)
 		h.ptr = 0
 	}
 }
@@ -287204,7 +287305,7 @@ func (h *ResolvedSampleScan) WeightColumn() (*ResolvedColumnHolder, error) {
 func (h *ResolvedSampleScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1249, 32, buf, wasm2go.Inv_1249_32)
+		module().enqueueFree(1249, 32, buf, wasm2go.Inv_1249_32)
 		h.ptr = 0
 	}
 }
@@ -287729,7 +287830,7 @@ func (h *ResolvedSampleScanProto) WeightColumn() (*ResolvedColumnHolderProto, er
 func (h *ResolvedSampleScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1250, 59, buf, wasm2go.Inv_1250_59)
+		module().enqueueFree(1250, 59, buf, wasm2go.Inv_1250_59)
 		h.ptr = 0
 	}
 }
@@ -288133,7 +288234,7 @@ func (h *ResolvedScan) SetNodeSource(v string) error {
 func (h *ResolvedScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1251, 27, buf, wasm2go.Inv_1251_27)
+		module().enqueueFree(1251, 27, buf, wasm2go.Inv_1251_27)
 		h.ptr = 0
 	}
 }
@@ -288435,7 +288536,7 @@ func (h *ResolvedScanProto) UnsafeArenaSetAllocatedParent(value *ResolvedNodePro
 func (h *ResolvedScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1252, 32, buf, wasm2go.Inv_1252_32)
+		module().enqueueFree(1252, 32, buf, wasm2go.Inv_1252_32)
 		h.ptr = 0
 	}
 }
@@ -288594,7 +288695,7 @@ func (h *ResolvedSequence) SetSequence(v SequenceNode) error {
 func (h *ResolvedSequence) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1253, 12, buf, wasm2go.Inv_1253_12)
+		module().enqueueFree(1253, 12, buf, wasm2go.Inv_1253_12)
 		h.ptr = 0
 	}
 }
@@ -288789,7 +288890,7 @@ func (h *ResolvedSequenceProto) UnsafeArenaSetAllocatedSequence(value *SequenceR
 func (h *ResolvedSequenceProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1254, 20, buf, wasm2go.Inv_1254_20)
+		module().enqueueFree(1254, 20, buf, wasm2go.Inv_1254_20)
 		h.ptr = 0
 	}
 }
@@ -288976,7 +289077,7 @@ func (h *ResolvedSetAsAction) SetEntityBodyText(v string) error {
 func (h *ResolvedSetAsAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1255, 14, buf, wasm2go.Inv_1255_14)
+		module().enqueueFree(1255, 14, buf, wasm2go.Inv_1255_14)
 		h.ptr = 0
 	}
 }
@@ -289208,7 +289309,7 @@ func (h *ResolvedSetAsActionProto) UnsafeArenaSetAllocatedParent(value *Resolved
 func (h *ResolvedSetAsActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1256, 24, buf, wasm2go.Inv_1256_24)
+		module().enqueueFree(1256, 24, buf, wasm2go.Inv_1256_24)
 		h.ptr = 0
 	}
 }
@@ -289387,7 +289488,7 @@ func (h *ResolvedSetCollateClause) SetCollationName(v ResolvedExprNode) error {
 func (h *ResolvedSetCollateClause) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1257, 13, buf, wasm2go.Inv_1257_13)
+		module().enqueueFree(1257, 13, buf, wasm2go.Inv_1257_13)
 		h.ptr = 0
 	}
 }
@@ -289582,7 +289683,7 @@ func (h *ResolvedSetCollateClauseProto) UnsafeArenaSetAllocatedParent(value *Res
 func (h *ResolvedSetCollateClauseProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1258, 20, buf, wasm2go.Inv_1258_20)
+		module().enqueueFree(1258, 20, buf, wasm2go.Inv_1258_20)
 		h.ptr = 0
 	}
 }
@@ -289873,7 +289974,7 @@ func (h *ResolvedSetOperationItem) SetScan(v ResolvedScanNode) error {
 func (h *ResolvedSetOperationItem) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1259, 20, buf, wasm2go.Inv_1259_20)
+		module().enqueueFree(1259, 20, buf, wasm2go.Inv_1259_20)
 		h.ptr = 0
 	}
 }
@@ -290113,7 +290214,7 @@ func (h *ResolvedSetOperationItemProto) UnsafeArenaSetAllocatedScan(value *AnyRe
 func (h *ResolvedSetOperationItemProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1260, 25, buf, wasm2go.Inv_1260_25)
+		module().enqueueFree(1260, 25, buf, wasm2go.Inv_1260_25)
 		h.ptr = 0
 	}
 }
@@ -290436,7 +290537,7 @@ func (h *ResolvedSetOperationScan) SetOpType(v ResolvedSetOperationScanEnums_Set
 func (h *ResolvedSetOperationScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1261, 22, buf, wasm2go.Inv_1261_22)
+		module().enqueueFree(1261, 22, buf, wasm2go.Inv_1261_22)
 		h.ptr = 0
 	}
 }
@@ -290705,7 +290806,7 @@ func (h *ResolvedSetOperationScanProto) UnsafeArenaSetAllocatedParent(value *Res
 func (h *ResolvedSetOperationScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1262, 29, buf, wasm2go.Inv_1262_29)
+		module().enqueueFree(1262, 29, buf, wasm2go.Inv_1262_29)
 		h.ptr = 0
 	}
 }
@@ -290943,7 +291044,7 @@ func (h *ResolvedSetOptionsAction) SetOptionList(v []*ResolvedOption) error {
 func (h *ResolvedSetOptionsAction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1263, 16, buf, wasm2go.Inv_1263_16)
+		module().enqueueFree(1263, 16, buf, wasm2go.Inv_1263_16)
 		h.ptr = 0
 	}
 }
@@ -291116,7 +291217,7 @@ func (h *ResolvedSetOptionsActionProto) UnsafeArenaSetAllocatedParent(value *Res
 func (h *ResolvedSetOptionsActionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1264, 17, buf, wasm2go.Inv_1264_17)
+		module().enqueueFree(1264, 17, buf, wasm2go.Inv_1264_17)
 		h.ptr = 0
 	}
 }
@@ -291387,7 +291488,7 @@ func (h *ResolvedSetTransactionStmt) SetReadWriteMode(v ResolvedBeginStmtEnums_R
 func (h *ResolvedSetTransactionStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1265, 19, buf, wasm2go.Inv_1265_19)
+		module().enqueueFree(1265, 19, buf, wasm2go.Inv_1265_19)
 		h.ptr = 0
 	}
 }
@@ -291592,7 +291693,7 @@ func (h *ResolvedSetTransactionStmtProto) UnsafeArenaSetAllocatedParent(value *R
 func (h *ResolvedSetTransactionStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1266, 21, buf, wasm2go.Inv_1266_21)
+		module().enqueueFree(1266, 21, buf, wasm2go.Inv_1266_21)
 		h.ptr = 0
 	}
 }
@@ -291897,7 +291998,7 @@ func (h *ResolvedShowStmt) SetNamePath(v []string) error {
 func (h *ResolvedShowStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1267, 22, buf, wasm2go.Inv_1267_22)
+		module().enqueueFree(1267, 22, buf, wasm2go.Inv_1267_22)
 		h.ptr = 0
 	}
 }
@@ -292189,7 +292290,7 @@ func (h *ResolvedShowStmtProto) UnsafeArenaSetAllocatedParent(value *ResolvedSta
 func (h *ResolvedShowStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1268, 31, buf, wasm2go.Inv_1268_31)
+		module().enqueueFree(1268, 31, buf, wasm2go.Inv_1268_31)
 		h.ptr = 0
 	}
 }
@@ -292250,7 +292351,7 @@ func (h *ResolvedSingleRowScan) NodeKindString() (string, error) {
 func (h *ResolvedSingleRowScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1269, 4, buf, wasm2go.Inv_1269_4)
+		module().enqueueFree(1269, 4, buf, wasm2go.Inv_1269_4)
 		h.ptr = 0
 	}
 }
@@ -292378,7 +292479,7 @@ func (h *ResolvedSingleRowScanProto) UnsafeArenaSetAllocatedParent(value *Resolv
 func (h *ResolvedSingleRowScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1270, 12, buf, wasm2go.Inv_1270_12)
+		module().enqueueFree(1270, 12, buf, wasm2go.Inv_1270_12)
 		h.ptr = 0
 	}
 }
@@ -292543,7 +292644,7 @@ func (h *ResolvedStartBatchStmt) SetBatchType(v string) error {
 func (h *ResolvedStartBatchStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1271, 12, buf, wasm2go.Inv_1271_12)
+		module().enqueueFree(1271, 12, buf, wasm2go.Inv_1271_12)
 		h.ptr = 0
 	}
 }
@@ -292723,7 +292824,7 @@ func (h *ResolvedStartBatchStmtProto) UnsafeArenaSetAllocatedParent(value *Resol
 func (h *ResolvedStartBatchStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1272, 18, buf, wasm2go.Inv_1272_18)
+		module().enqueueFree(1272, 18, buf, wasm2go.Inv_1272_18)
 		h.ptr = 0
 	}
 }
@@ -292947,7 +293048,7 @@ func (h *ResolvedStatement) SetHintList(v []*ResolvedOption) error {
 func (h *ResolvedStatement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1273, 15, buf, wasm2go.Inv_1273_15)
+		module().enqueueFree(1273, 15, buf, wasm2go.Inv_1273_15)
 		h.ptr = 0
 	}
 }
@@ -293120,7 +293221,7 @@ func (h *ResolvedStatementProto) UnsafeArenaSetAllocatedParent(value *ResolvedNo
 func (h *ResolvedStatementProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1274, 17, buf, wasm2go.Inv_1274_17)
+		module().enqueueFree(1274, 17, buf, wasm2go.Inv_1274_17)
 		h.ptr = 0
 	}
 }
@@ -293327,7 +293428,7 @@ func (h *ResolvedStatementWithPipeOperatorsStmt) SuffixSubpipelineSql() (*Resolv
 func (h *ResolvedStatementWithPipeOperatorsStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1275, 16, buf, wasm2go.Inv_1275_16)
+		module().enqueueFree(1275, 16, buf, wasm2go.Inv_1275_16)
 		h.ptr = 0
 	}
 }
@@ -293589,7 +293690,7 @@ func (h *ResolvedStatementWithPipeOperatorsStmtProto) UnsafeArenaSetAllocatedSuf
 func (h *ResolvedStatementWithPipeOperatorsStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1276, 28, buf, wasm2go.Inv_1276_28)
+		module().enqueueFree(1276, 28, buf, wasm2go.Inv_1276_28)
 		h.ptr = 0
 	}
 }
@@ -293783,7 +293884,7 @@ func (h *ResolvedStaticDescribeScan) SetInputScan(v ResolvedScanNode, propagateO
 func (h *ResolvedStaticDescribeScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1277, 15, buf, wasm2go.Inv_1277_15)
+		module().enqueueFree(1277, 15, buf, wasm2go.Inv_1277_15)
 		h.ptr = 0
 	}
 }
@@ -294030,7 +294131,7 @@ func (h *ResolvedStaticDescribeScanProto) UnsafeArenaSetAllocatedParent(value *R
 func (h *ResolvedStaticDescribeScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1278, 26, buf, wasm2go.Inv_1278_26)
+		module().enqueueFree(1278, 26, buf, wasm2go.Inv_1278_26)
 		h.ptr = 0
 	}
 }
@@ -294193,7 +294294,7 @@ func (h *ResolvedStringWithLocation) Value() (string, error) {
 func (h *ResolvedStringWithLocation) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1279, 12, buf, wasm2go.Inv_1279_12)
+		module().enqueueFree(1279, 12, buf, wasm2go.Inv_1279_12)
 		h.ptr = 0
 	}
 }
@@ -294373,7 +294474,7 @@ func (h *ResolvedStringWithLocationProto) Value() (string, error) {
 func (h *ResolvedStringWithLocationProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1280, 18, buf, wasm2go.Inv_1280_18)
+		module().enqueueFree(1280, 18, buf, wasm2go.Inv_1280_18)
 		h.ptr = 0
 	}
 }
@@ -294561,7 +294662,7 @@ func (h *ResolvedSubpipeline) SetScan(v ResolvedScanNode) error {
 func (h *ResolvedSubpipeline) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1281, 13, buf, wasm2go.Inv_1281_13)
+		module().enqueueFree(1281, 13, buf, wasm2go.Inv_1281_13)
 		h.ptr = 0
 	}
 }
@@ -294633,7 +294734,7 @@ func (h *ResolvedSubpipelineInputScan) NodeKindString() (string, error) {
 func (h *ResolvedSubpipelineInputScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1282, 4, buf, wasm2go.Inv_1282_4)
+		module().enqueueFree(1282, 4, buf, wasm2go.Inv_1282_4)
 		h.ptr = 0
 	}
 }
@@ -294761,7 +294862,7 @@ func (h *ResolvedSubpipelineInputScanProto) UnsafeArenaSetAllocatedParent(value 
 func (h *ResolvedSubpipelineInputScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1283, 12, buf, wasm2go.Inv_1283_12)
+		module().enqueueFree(1283, 12, buf, wasm2go.Inv_1283_12)
 		h.ptr = 0
 	}
 }
@@ -294956,7 +295057,7 @@ func (h *ResolvedSubpipelineProto) UnsafeArenaSetAllocatedScan(value *AnyResolve
 func (h *ResolvedSubpipelineProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1284, 20, buf, wasm2go.Inv_1284_20)
+		module().enqueueFree(1284, 20, buf, wasm2go.Inv_1284_20)
 		h.ptr = 0
 	}
 }
@@ -295201,7 +295302,7 @@ func (h *ResolvedSubpipelineStmt) TableScan() (*ResolvedTableScan, error) {
 func (h *ResolvedSubpipelineStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1285, 19, buf, wasm2go.Inv_1285_19)
+		module().enqueueFree(1285, 19, buf, wasm2go.Inv_1285_19)
 		h.ptr = 0
 	}
 }
@@ -295530,7 +295631,7 @@ func (h *ResolvedSubpipelineStmtProto) UnsafeArenaSetAllocatedTableScan(value *R
 func (h *ResolvedSubpipelineStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1286, 36, buf, wasm2go.Inv_1286_36)
+		module().enqueueFree(1286, 36, buf, wasm2go.Inv_1286_36)
 		h.ptr = 0
 	}
 }
@@ -296073,7 +296174,7 @@ func (h *ResolvedSubqueryExpr) SubqueryType() (ResolvedSubqueryExprEnums_Subquer
 func (h *ResolvedSubqueryExpr) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1287, 32, buf, wasm2go.Inv_1287_32)
+		module().enqueueFree(1287, 32, buf, wasm2go.Inv_1287_32)
 		h.ptr = 0
 	}
 }
@@ -296524,7 +296625,7 @@ func (h *ResolvedSubqueryExprProto) UnsafeArenaSetAllocatedSubquery(value *AnyRe
 func (h *ResolvedSubqueryExprProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1288, 50, buf, wasm2go.Inv_1288_50)
+		module().enqueueFree(1288, 50, buf, wasm2go.Inv_1288_50)
 		h.ptr = 0
 	}
 }
@@ -296755,7 +296856,7 @@ func (h *ResolvedSystemVariable) SetNamePath(v []string) error {
 func (h *ResolvedSystemVariable) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1289, 17, buf, wasm2go.Inv_1289_17)
+		module().enqueueFree(1289, 17, buf, wasm2go.Inv_1289_17)
 		h.ptr = 0
 	}
 }
@@ -296928,7 +297029,7 @@ func (h *ResolvedSystemVariableProto) UnsafeArenaSetAllocatedParent(value *Resol
 func (h *ResolvedSystemVariableProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1290, 17, buf, wasm2go.Inv_1290_17)
+		module().enqueueFree(1290, 17, buf, wasm2go.Inv_1290_17)
 		h.ptr = 0
 	}
 }
@@ -297434,7 +297535,7 @@ func (h *ResolvedTVFScan) Tvf() (*TableValuedFunction, error) {
 func (h *ResolvedTVFScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1291, 31, buf, wasm2go.Inv_1291_31)
+		module().enqueueFree(1291, 31, buf, wasm2go.Inv_1291_31)
 		h.ptr = 0
 	}
 }
@@ -297891,7 +297992,7 @@ func (h *ResolvedTVFScanProto) UnsafeArenaSetAllocatedTvf(value *TableValuedFunc
 func (h *ResolvedTVFScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1292, 51, buf, wasm2go.Inv_1292_51)
+		module().enqueueFree(1292, 51, buf, wasm2go.Inv_1292_51)
 		h.ptr = 0
 	}
 }
@@ -298169,7 +298270,7 @@ func (h *ResolvedTableAndColumnInfo) Table() (TableNode, error) {
 func (h *ResolvedTableAndColumnInfo) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1293, 19, buf, wasm2go.Inv_1293_19)
+		module().enqueueFree(1293, 19, buf, wasm2go.Inv_1293_19)
 		h.ptr = 0
 	}
 }
@@ -298395,7 +298496,7 @@ func (h *ResolvedTableAndColumnInfoProto) UnsafeArenaSetAllocatedTable(value *Ta
 func (h *ResolvedTableAndColumnInfoProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1294, 24, buf, wasm2go.Inv_1294_24)
+		module().enqueueFree(1294, 24, buf, wasm2go.Inv_1294_24)
 		h.ptr = 0
 	}
 }
@@ -298942,7 +299043,7 @@ func (h *ResolvedTableScan) TableColumnListSize() (int32, error) {
 func (h *ResolvedTableScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1295, 36, buf, wasm2go.Inv_1295_36)
+		module().enqueueFree(1295, 36, buf, wasm2go.Inv_1295_36)
 		h.ptr = 0
 	}
 }
@@ -299431,7 +299532,7 @@ func (h *ResolvedTableScanProto) UnsafeArenaSetAllocatedTable(value *TableRefPro
 func (h *ResolvedTableScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1296, 55, buf, wasm2go.Inv_1296_55)
+		module().enqueueFree(1296, 55, buf, wasm2go.Inv_1296_55)
 		h.ptr = 0
 	}
 }
@@ -299650,7 +299751,7 @@ func (h *ResolvedTruncateStmt) WhereExpr() (ResolvedExprNode, error) {
 func (h *ResolvedTruncateStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1297, 16, buf, wasm2go.Inv_1297_16)
+		module().enqueueFree(1297, 16, buf, wasm2go.Inv_1297_16)
 		h.ptr = 0
 	}
 }
@@ -299912,7 +300013,7 @@ func (h *ResolvedTruncateStmtProto) WhereExpr() (*AnyResolvedExprProto, error) {
 func (h *ResolvedTruncateStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1298, 28, buf, wasm2go.Inv_1298_28)
+		module().enqueueFree(1298, 28, buf, wasm2go.Inv_1298_28)
 		h.ptr = 0
 	}
 }
@@ -300324,7 +300425,7 @@ func (h *ResolvedUndropStmt) SetSchemaObjectKind(v string) error {
 func (h *ResolvedUndropStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1299, 30, buf, wasm2go.Inv_1299_30)
+		module().enqueueFree(1299, 30, buf, wasm2go.Inv_1299_30)
 		h.ptr = 0
 	}
 }
@@ -300693,7 +300794,7 @@ func (h *ResolvedUndropStmtProto) UnsafeArenaSetAllocatedParent(value *ResolvedS
 func (h *ResolvedUndropStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1300, 40, buf, wasm2go.Inv_1300_40)
+		module().enqueueFree(1300, 40, buf, wasm2go.Inv_1300_40)
 		h.ptr = 0
 	}
 }
@@ -300925,7 +301026,7 @@ func (h *ResolvedUnnestItem) SetElementColumn(v *ResolvedColumn) error {
 func (h *ResolvedUnnestItem) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1301, 18, buf, wasm2go.Inv_1301_18)
+		module().enqueueFree(1301, 18, buf, wasm2go.Inv_1301_18)
 		h.ptr = 0
 	}
 }
@@ -301254,7 +301355,7 @@ func (h *ResolvedUnnestItemProto) UnsafeArenaSetAllocatedParent(value *ResolvedA
 func (h *ResolvedUnnestItemProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1302, 36, buf, wasm2go.Inv_1302_36)
+		module().enqueueFree(1302, 36, buf, wasm2go.Inv_1302_36)
 		h.ptr = 0
 	}
 }
@@ -301496,7 +301597,7 @@ func (h *ResolvedUnpivotArg) SetColumnList(v []*ResolvedColumnRef) error {
 func (h *ResolvedUnpivotArg) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1303, 16, buf, wasm2go.Inv_1303_16)
+		module().enqueueFree(1303, 16, buf, wasm2go.Inv_1303_16)
 		h.ptr = 0
 	}
 }
@@ -301669,7 +301770,7 @@ func (h *ResolvedUnpivotArgProto) UnsafeArenaSetAllocatedParent(value *ResolvedA
 func (h *ResolvedUnpivotArgProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1304, 17, buf, wasm2go.Inv_1304_17)
+		module().enqueueFree(1304, 17, buf, wasm2go.Inv_1304_17)
 		h.ptr = 0
 	}
 }
@@ -302388,7 +302489,7 @@ func (h *ResolvedUnpivotScan) ValueColumnListSize() (int32, error) {
 func (h *ResolvedUnpivotScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1305, 42, buf, wasm2go.Inv_1305_42)
+		module().enqueueFree(1305, 42, buf, wasm2go.Inv_1305_42)
 		h.ptr = 0
 	}
 }
@@ -302862,7 +302963,7 @@ func (h *ResolvedUnpivotScanProto) ValueColumnListSize() (int32, error) {
 func (h *ResolvedUnpivotScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1306, 52, buf, wasm2go.Inv_1306_52)
+		module().enqueueFree(1306, 52, buf, wasm2go.Inv_1306_52)
 		h.ptr = 0
 	}
 }
@@ -302924,7 +303025,7 @@ func (h *ResolvedUnsetArgumentScan) NodeKindString() (string, error) {
 func (h *ResolvedUnsetArgumentScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1307, 4, buf, wasm2go.Inv_1307_4)
+		module().enqueueFree(1307, 4, buf, wasm2go.Inv_1307_4)
 		h.ptr = 0
 	}
 }
@@ -303052,7 +303153,7 @@ func (h *ResolvedUnsetArgumentScanProto) UnsafeArenaSetAllocatedParent(value *Re
 func (h *ResolvedUnsetArgumentScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1308, 12, buf, wasm2go.Inv_1308_12)
+		module().enqueueFree(1308, 12, buf, wasm2go.Inv_1308_12)
 		h.ptr = 0
 	}
 }
@@ -303329,7 +303430,7 @@ func (h *ResolvedUpdateConstructor) UpdateFieldItemListSize() (int32, error) {
 func (h *ResolvedUpdateConstructor) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1309, 21, buf, wasm2go.Inv_1309_21)
+		module().enqueueFree(1309, 21, buf, wasm2go.Inv_1309_21)
 		h.ptr = 0
 	}
 }
@@ -303621,7 +303722,7 @@ func (h *ResolvedUpdateConstructorProto) UpdateFieldItemListSize() (int32, error
 func (h *ResolvedUpdateConstructorProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1310, 31, buf, wasm2go.Inv_1310_31)
+		module().enqueueFree(1310, 31, buf, wasm2go.Inv_1310_31)
 		h.ptr = 0
 	}
 }
@@ -303938,7 +304039,7 @@ func (h *ResolvedUpdateFieldItem) SetProtoFieldPath(v []*FieldDescriptor) error 
 func (h *ResolvedUpdateFieldItem) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1311, 22, buf, wasm2go.Inv_1311_22)
+		module().enqueueFree(1311, 22, buf, wasm2go.Inv_1311_22)
 		h.ptr = 0
 	}
 }
@@ -304210,7 +304311,7 @@ func (h *ResolvedUpdateFieldItemProto) UnsafeArenaSetAllocatedParent(value *Reso
 func (h *ResolvedUpdateFieldItemProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1312, 29, buf, wasm2go.Inv_1312_29)
+		module().enqueueFree(1312, 29, buf, wasm2go.Inv_1312_29)
 		h.ptr = 0
 	}
 }
@@ -305113,7 +305214,7 @@ func (h *ResolvedUpdateItem) UpdateListSize() (int32, error) {
 func (h *ResolvedUpdateItem) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1313, 43, buf, wasm2go.Inv_1313_43)
+		module().enqueueFree(1313, 43, buf, wasm2go.Inv_1313_43)
 		h.ptr = 0
 	}
 }
@@ -305344,7 +305445,7 @@ func (h *ResolvedUpdateItemElement) UpdateItemMode() (ResolvedUpdateItemElementE
 func (h *ResolvedUpdateItemElement) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1314, 18, buf, wasm2go.Inv_1314_18)
+		module().enqueueFree(1314, 18, buf, wasm2go.Inv_1314_18)
 		h.ptr = 0
 	}
 }
@@ -305638,7 +305739,7 @@ func (h *ResolvedUpdateItemElementProto) UpdateItemMode() (ResolvedUpdateItemEle
 func (h *ResolvedUpdateItemElementProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1315, 32, buf, wasm2go.Inv_1315_32)
+		module().enqueueFree(1315, 32, buf, wasm2go.Inv_1315_32)
 		h.ptr = 0
 	}
 }
@@ -306147,7 +306248,7 @@ func (h *ResolvedUpdateItemProto) UpdateListSize() (int32, error) {
 func (h *ResolvedUpdateItemProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1316, 56, buf, wasm2go.Inv_1316_56)
+		module().enqueueFree(1316, 56, buf, wasm2go.Inv_1316_56)
 		h.ptr = 0
 	}
 }
@@ -306955,7 +307056,7 @@ func (h *ResolvedUpdateStmt) WhereExpr() (ResolvedExprNode, error) {
 func (h *ResolvedUpdateStmt) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1317, 54, buf, wasm2go.Inv_1317_54)
+		module().enqueueFree(1317, 54, buf, wasm2go.Inv_1317_54)
 		h.ptr = 0
 	}
 }
@@ -307647,7 +307748,7 @@ func (h *ResolvedUpdateStmtProto) WhereExpr() (*AnyResolvedExprProto, error) {
 func (h *ResolvedUpdateStmtProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1318, 79, buf, wasm2go.Inv_1318_79)
+		module().enqueueFree(1318, 79, buf, wasm2go.Inv_1318_79)
 		h.ptr = 0
 	}
 }
@@ -307881,7 +307982,7 @@ func (h *ResolvedWindowFrame) StartExpr() (*ResolvedWindowFrameExpr, error) {
 func (h *ResolvedWindowFrame) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1319, 19, buf, wasm2go.Inv_1319_19)
+		module().enqueueFree(1319, 19, buf, wasm2go.Inv_1319_19)
 		h.ptr = 0
 	}
 }
@@ -308084,7 +308185,7 @@ func (h *ResolvedWindowFrameExpr) SetExpression(v ResolvedExprNode) error {
 func (h *ResolvedWindowFrameExpr) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1320, 16, buf, wasm2go.Inv_1320_16)
+		module().enqueueFree(1320, 16, buf, wasm2go.Inv_1320_16)
 		h.ptr = 0
 	}
 }
@@ -308311,7 +308412,7 @@ func (h *ResolvedWindowFrameExprProto) UnsafeArenaSetAllocatedParent(value *Reso
 func (h *ResolvedWindowFrameExprProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1321, 24, buf, wasm2go.Inv_1321_24)
+		module().enqueueFree(1321, 24, buf, wasm2go.Inv_1321_24)
 		h.ptr = 0
 	}
 }
@@ -308605,7 +308706,7 @@ func (h *ResolvedWindowFrameProto) UnsafeArenaSetAllocatedStartExpr(value *Resol
 func (h *ResolvedWindowFrameProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1322, 32, buf, wasm2go.Inv_1322_32)
+		module().enqueueFree(1322, 32, buf, wasm2go.Inv_1322_32)
 		h.ptr = 0
 	}
 }
@@ -308930,7 +309031,7 @@ func (h *ResolvedWindowOrdering) SetOrderByItemList(v []*ResolvedOrderByItem) er
 func (h *ResolvedWindowOrdering) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1323, 22, buf, wasm2go.Inv_1323_22)
+		module().enqueueFree(1323, 22, buf, wasm2go.Inv_1323_22)
 		h.ptr = 0
 	}
 }
@@ -309148,7 +309249,7 @@ func (h *ResolvedWindowOrderingProto) UnsafeArenaSetAllocatedParent(value *Resol
 func (h *ResolvedWindowOrderingProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1324, 22, buf, wasm2go.Inv_1324_22)
+		module().enqueueFree(1324, 22, buf, wasm2go.Inv_1324_22)
 		h.ptr = 0
 	}
 }
@@ -309603,7 +309704,7 @@ func (h *ResolvedWindowPartitioning) SetPartitionByList(v []*ResolvedColumnRef) 
 func (h *ResolvedWindowPartitioning) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1325, 29, buf, wasm2go.Inv_1325_29)
+		module().enqueueFree(1325, 29, buf, wasm2go.Inv_1325_29)
 		h.ptr = 0
 	}
 }
@@ -309866,7 +309967,7 @@ func (h *ResolvedWindowPartitioningProto) UnsafeArenaSetAllocatedParent(value *R
 func (h *ResolvedWindowPartitioningProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1326, 27, buf, wasm2go.Inv_1326_27)
+		module().enqueueFree(1326, 27, buf, wasm2go.Inv_1326_27)
 		h.ptr = 0
 	}
 }
@@ -310061,7 +310162,7 @@ func (h *ResolvedWithEntry) WithSubquery() (ResolvedScanNode, error) {
 func (h *ResolvedWithEntry) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1327, 15, buf, wasm2go.Inv_1327_15)
+		module().enqueueFree(1327, 15, buf, wasm2go.Inv_1327_15)
 		h.ptr = 0
 	}
 }
@@ -310308,7 +310409,7 @@ func (h *ResolvedWithEntryProto) WithSubquery() (*AnyResolvedScanProto, error) {
 func (h *ResolvedWithEntryProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1328, 26, buf, wasm2go.Inv_1328_26)
+		module().enqueueFree(1328, 26, buf, wasm2go.Inv_1328_26)
 		h.ptr = 0
 	}
 }
@@ -310595,7 +310696,7 @@ func (h *ResolvedWithExpr) SetExpr(v ResolvedExprNode) error {
 func (h *ResolvedWithExpr) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1329, 19, buf, wasm2go.Inv_1329_19)
+		module().enqueueFree(1329, 19, buf, wasm2go.Inv_1329_19)
 		h.ptr = 0
 	}
 }
@@ -310835,7 +310936,7 @@ func (h *ResolvedWithExprProto) UnsafeArenaSetAllocatedParent(value *ResolvedExp
 func (h *ResolvedWithExprProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1330, 25, buf, wasm2go.Inv_1330_25)
+		module().enqueueFree(1330, 25, buf, wasm2go.Inv_1330_25)
 		h.ptr = 0
 	}
 }
@@ -311067,7 +311168,7 @@ func (h *ResolvedWithPartitionColumns) SetColumnDefinitionList(v []*ResolvedColu
 func (h *ResolvedWithPartitionColumns) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1331, 16, buf, wasm2go.Inv_1331_16)
+		module().enqueueFree(1331, 16, buf, wasm2go.Inv_1331_16)
 		h.ptr = 0
 	}
 }
@@ -311240,7 +311341,7 @@ func (h *ResolvedWithPartitionColumnsProto) UnsafeArenaSetAllocatedParent(value 
 func (h *ResolvedWithPartitionColumnsProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1332, 17, buf, wasm2go.Inv_1332_17)
+		module().enqueueFree(1332, 17, buf, wasm2go.Inv_1332_17)
 		h.ptr = 0
 	}
 }
@@ -311402,7 +311503,7 @@ func (h *ResolvedWithRefScan) WithQueryName() (string, error) {
 func (h *ResolvedWithRefScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1333, 12, buf, wasm2go.Inv_1333_12)
+		module().enqueueFree(1333, 12, buf, wasm2go.Inv_1333_12)
 		h.ptr = 0
 	}
 }
@@ -311582,7 +311683,7 @@ func (h *ResolvedWithRefScanProto) WithQueryName() (string, error) {
 func (h *ResolvedWithRefScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1334, 18, buf, wasm2go.Inv_1334_18)
+		module().enqueueFree(1334, 18, buf, wasm2go.Inv_1334_18)
 		h.ptr = 0
 	}
 }
@@ -311944,7 +312045,7 @@ func (h *ResolvedWithScan) WithEntryListSize() (int32, error) {
 func (h *ResolvedWithScan) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1335, 21, buf, wasm2go.Inv_1335_21)
+		module().enqueueFree(1335, 21, buf, wasm2go.Inv_1335_21)
 		h.ptr = 0
 	}
 }
@@ -312216,7 +312317,7 @@ func (h *ResolvedWithScanProto) WithEntryListSize() (int32, error) {
 func (h *ResolvedWithScanProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1336, 29, buf, wasm2go.Inv_1336_29)
+		module().enqueueFree(1336, 29, buf, wasm2go.Inv_1336_29)
 		h.ptr = 0
 	}
 }
@@ -312373,7 +312474,7 @@ func (h *RewriteOptions) UnsafeArenaSetAllocatedGroupingSetRewriteOptions(value 
 func (h *RewriteOptions) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1337, 16, buf, wasm2go.Inv_1337_16)
+		module().enqueueFree(1337, 16, buf, wasm2go.Inv_1337_16)
 		h.ptr = 0
 	}
 }
@@ -312522,7 +312623,7 @@ func NewRewriterFromImpl(impl RewriterCallback) (*Rewriter, error) {
 func (h *Rewriter) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1338, 4, buf, wasm2go.Inv_1338_4)
+		module().enqueueFree(1338, 4, buf, wasm2go.Inv_1338_4)
 		h.ptr = 0
 	}
 }
@@ -313089,7 +313190,7 @@ func (h *SQLConstant) Type() (Googlesql_TypeNode, error) {
 func (h *SQLConstant) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1340, 12, buf, wasm2go.Inv_1340_12)
+		module().enqueueFree(1340, 12, buf, wasm2go.Inv_1340_12)
 		h.ptr = 0
 	}
 }
@@ -313247,7 +313348,7 @@ func (h *SQLTableValuedFunction) Query() (ResolvedScanNode, error) {
 func (h *SQLTableValuedFunction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1341, 6, buf, wasm2go.Inv_1341_6)
+		module().enqueueFree(1341, 6, buf, wasm2go.Inv_1341_6)
 		h.ptr = 0
 	}
 }
@@ -313307,7 +313408,7 @@ func (h *SQLView) ViewQuery() (ResolvedScanNode, error) {
 func (h *SQLView) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1342, 2, buf, wasm2go.Inv_1342_2)
+		module().enqueueFree(1342, 2, buf, wasm2go.Inv_1342_2)
 		h.ptr = 0
 	}
 }
@@ -313496,7 +313597,7 @@ func (h *SafeArena) BytesUntilNextAllocation() (uint64, error) {
 func (h *SafeArena) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1447, 14, buf, wasm2go.Inv_1447_14)
+		module().enqueueFree(1447, 14, buf, wasm2go.Inv_1447_14)
 		h.ptr = 0
 	}
 }
@@ -313545,7 +313646,7 @@ func (h *SeparatedIdentifierTmpNode) InitFields() error {
 func (h *SeparatedIdentifierTmpNode) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1443, 2, buf, wasm2go.Inv_1443_2)
+		module().enqueueFree(1443, 2, buf, wasm2go.Inv_1443_2)
 		h.ptr = 0
 	}
 }
@@ -313621,7 +313722,7 @@ func NewSequenceFromImpl(impl SequenceCallback) (*Sequence, error) {
 func (h *Sequence) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1343, 3, buf, wasm2go.Inv_1343_3)
+		module().enqueueFree(1343, 3, buf, wasm2go.Inv_1343_3)
 		h.ptr = 0
 	}
 }
@@ -313682,7 +313783,7 @@ func (h *SequenceNumber) GetNext() (int64, error) {
 func (h *SequenceNumber) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1448, 2, buf, wasm2go.Inv_1448_2)
+		module().enqueueFree(1448, 2, buf, wasm2go.Inv_1448_2)
 		h.ptr = 0
 	}
 }
@@ -313876,7 +313977,7 @@ func (h *SequenceRefProto) SetAllocatedName() (string, error) {
 func (h *SequenceRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1344, 20, buf, wasm2go.Inv_1344_20)
+		module().enqueueFree(1344, 20, buf, wasm2go.Inv_1344_20)
 		h.ptr = 0
 	}
 }
@@ -314113,7 +314214,7 @@ func (h *SignatureMatchResult) SetMismatchMessage(message string) error {
 func (h *SignatureMatchResult) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1345, 21, buf, wasm2go.Inv_1345_21)
+		module().enqueueFree(1345, 21, buf, wasm2go.Inv_1345_21)
 		h.ptr = 0
 	}
 }
@@ -314248,7 +314349,7 @@ func (h *SimpleAnonymizationInfoProto) UseridColumnNameSize() (int32, error) {
 func (h *SimpleAnonymizationInfoProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1346, 13, buf, wasm2go.Inv_1346_13)
+		module().enqueueFree(1346, 13, buf, wasm2go.Inv_1346_13)
 		h.ptr = 0
 	}
 }
@@ -315706,7 +315807,7 @@ func (h *SimpleCatalog) Types() ([]Googlesql_TypeNode, error) {
 func (h *SimpleCatalog) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1347, 114, buf, wasm2go.Inv_1347_114)
+		module().enqueueFree(1347, 114, buf, wasm2go.Inv_1347_114)
 		h.ptr = 0
 	}
 }
@@ -316433,7 +316534,7 @@ func (h *SimpleCatalogProto) UnsafeArenaSetAllocatedBuiltinFunctionOptions(value
 func (h *SimpleCatalogProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1348, 80, buf, wasm2go.Inv_1348_80)
+		module().enqueueFree(1348, 80, buf, wasm2go.Inv_1348_80)
 		h.ptr = 0
 	}
 }
@@ -316642,7 +316743,7 @@ func (h *SimpleCatalogProto_NamedTypeProto) UnsafeArenaSetAllocatedType(value *T
 func (h *SimpleCatalogProto_NamedTypeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1349, 22, buf, wasm2go.Inv_1349_22)
+		module().enqueueFree(1349, 22, buf, wasm2go.Inv_1349_22)
 		h.ptr = 0
 	}
 }
@@ -316800,7 +316901,7 @@ func (h *SimpleColumn) AnnotatedType() (*AnnotatedType, error) {
 func (h *SimpleColumn) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1350, 10, buf, wasm2go.Inv_1350_10)
+		module().enqueueFree(1350, 10, buf, wasm2go.Inv_1350_10)
 		h.ptr = 0
 	}
 }
@@ -317271,7 +317372,7 @@ func (h *SimpleColumnProto) UnsafeArenaSetAllocatedType(value *TypeProto) error 
 func (h *SimpleColumnProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1351, 54, buf, wasm2go.Inv_1351_54)
+		module().enqueueFree(1351, 54, buf, wasm2go.Inv_1351_54)
 		h.ptr = 0
 	}
 }
@@ -317334,7 +317435,7 @@ func (h *SimpleConnection) Serialize(proto *SimpleConnectionProto) error {
 func (h *SimpleConnection) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1352, 4, buf, wasm2go.Inv_1352_4)
+		module().enqueueFree(1352, 4, buf, wasm2go.Inv_1352_4)
 		h.ptr = 0
 	}
 }
@@ -317476,7 +317577,7 @@ func (h *SimpleConnectionProto) SetAllocatedName() (string, error) {
 func (h *SimpleConnectionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1353, 14, buf, wasm2go.Inv_1353_14)
+		module().enqueueFree(1353, 14, buf, wasm2go.Inv_1353_14)
 		h.ptr = 0
 	}
 }
@@ -317592,7 +317693,7 @@ func (h *SimpleConstant) Value() (*Value, error) {
 func (h *SimpleConstant) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1354, 8, buf, wasm2go.Inv_1354_8)
+		module().enqueueFree(1354, 8, buf, wasm2go.Inv_1354_8)
 		h.ptr = 0
 	}
 }
@@ -317861,7 +317962,7 @@ func (h *SimpleConstantProto) Value() (*ValueProto, error) {
 func (h *SimpleConstantProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1355, 29, buf, wasm2go.Inv_1355_29)
+		module().enqueueFree(1355, 29, buf, wasm2go.Inv_1355_29)
 		h.ptr = 0
 	}
 }
@@ -317971,7 +318072,7 @@ func (h *SimpleErrorCollector) RecordError2(filename string, elementName string,
 func (h *SimpleErrorCollector) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1356, 6, buf, wasm2go.Inv_1356_6)
+		module().enqueueFree(1356, 6, buf, wasm2go.Inv_1356_6)
 		h.ptr = 0
 	}
 }
@@ -318066,7 +318167,7 @@ func (h *SimpleEvaluatorTableIterator) Status() error {
 func (h *SimpleEvaluatorTableIterator) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1357, 8, buf, wasm2go.Inv_1357_8)
+		module().enqueueFree(1357, 8, buf, wasm2go.Inv_1357_8)
 		h.ptr = 0
 	}
 }
@@ -318129,7 +318230,7 @@ func (h *SimpleGraphDynamicLabel) LabelExpression() (string, error) {
 func (h *SimpleGraphDynamicLabel) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1358, 4, buf, wasm2go.Inv_1358_4)
+		module().enqueueFree(1358, 4, buf, wasm2go.Inv_1358_4)
 		h.ptr = 0
 	}
 }
@@ -318192,7 +318293,7 @@ func (h *SimpleGraphDynamicProperties) PropertiesExpression() (string, error) {
 func (h *SimpleGraphDynamicProperties) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1359, 4, buf, wasm2go.Inv_1359_4)
+		module().enqueueFree(1359, 4, buf, wasm2go.Inv_1359_4)
 		h.ptr = 0
 	}
 }
@@ -318422,7 +318523,7 @@ func (h *SimpleGraphEdgeTable) Kind() (GraphElementTable_Kind, error) {
 func (h *SimpleGraphEdgeTable) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1360, 16, buf, wasm2go.Inv_1360_16)
+		module().enqueueFree(1360, 16, buf, wasm2go.Inv_1360_16)
 		h.ptr = 0
 	}
 }
@@ -318564,7 +318665,7 @@ func (h *SimpleGraphElementDynamicLabelProto) SetAllocatedLabelExpression() (str
 func (h *SimpleGraphElementDynamicLabelProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1361, 14, buf, wasm2go.Inv_1361_14)
+		module().enqueueFree(1361, 14, buf, wasm2go.Inv_1361_14)
 		h.ptr = 0
 	}
 }
@@ -318706,7 +318807,7 @@ func (h *SimpleGraphElementDynamicPropertiesProto) SetAllocatedPropertiesExpress
 func (h *SimpleGraphElementDynamicPropertiesProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1362, 14, buf, wasm2go.Inv_1362_14)
+		module().enqueueFree(1362, 14, buf, wasm2go.Inv_1362_14)
 		h.ptr = 0
 	}
 }
@@ -318798,7 +318899,7 @@ func (h *SimpleGraphElementLabel) Serialize(proto *SimpleGraphElementLabelProto)
 func (h *SimpleGraphElementLabel) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1363, 5, buf, wasm2go.Inv_1363_5)
+		module().enqueueFree(1363, 5, buf, wasm2go.Inv_1363_5)
 		h.ptr = 0
 	}
 }
@@ -319030,7 +319131,7 @@ func (h *SimpleGraphElementLabelProto) SetAllocatedName() (string, error) {
 func (h *SimpleGraphElementLabelProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1364, 24, buf, wasm2go.Inv_1364_24)
+		module().enqueueFree(1364, 24, buf, wasm2go.Inv_1364_24)
 		h.ptr = 0
 	}
 }
@@ -319690,7 +319791,7 @@ func (h *SimpleGraphElementTableProto) UnsafeArenaSetAllocatedSourceNodeTable(va
 func (h *SimpleGraphElementTableProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1365, 75, buf, wasm2go.Inv_1365_75)
+		module().enqueueFree(1365, 75, buf, wasm2go.Inv_1365_75)
 		h.ptr = 0
 	}
 }
@@ -319898,7 +319999,7 @@ func (h *SimpleGraphNodeTable) Kind() (GraphElementTable_Kind, error) {
 func (h *SimpleGraphNodeTable) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1366, 14, buf, wasm2go.Inv_1366_14)
+		module().enqueueFree(1366, 14, buf, wasm2go.Inv_1366_14)
 		h.ptr = 0
 	}
 }
@@ -320011,7 +320112,7 @@ func (h *SimpleGraphNodeTableReference) Serialize(proto *SimpleGraphNodeTableRef
 func (h *SimpleGraphNodeTableReference) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1367, 5, buf, wasm2go.Inv_1367_5)
+		module().enqueueFree(1367, 5, buf, wasm2go.Inv_1367_5)
 		h.ptr = 0
 	}
 }
@@ -320215,7 +320316,7 @@ func (h *SimpleGraphNodeTableReferenceProto) SetNodeTableColumns(index int32, va
 func (h *SimpleGraphNodeTableReferenceProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1368, 22, buf, wasm2go.Inv_1368_22)
+		module().enqueueFree(1368, 22, buf, wasm2go.Inv_1368_22)
 		h.ptr = 0
 	}
 }
@@ -320337,7 +320438,7 @@ func (h *SimpleGraphPropertyDeclaration) Kind() (GraphPropertyDeclaration_Kind, 
 func (h *SimpleGraphPropertyDeclaration) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1369, 7, buf, wasm2go.Inv_1369_7)
+		module().enqueueFree(1369, 7, buf, wasm2go.Inv_1369_7)
 		h.ptr = 0
 	}
 }
@@ -320690,7 +320791,7 @@ func (h *SimpleGraphPropertyDeclarationProto) UnsafeArenaSetAllocatedType(value 
 func (h *SimpleGraphPropertyDeclarationProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1370, 39, buf, wasm2go.Inv_1370_39)
+		module().enqueueFree(1370, 39, buf, wasm2go.Inv_1370_39)
 		h.ptr = 0
 	}
 }
@@ -320760,7 +320861,7 @@ func (h *SimpleGraphPropertyDefinition) ExpressionSql() (string, error) {
 func (h *SimpleGraphPropertyDefinition) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1371, 4, buf, wasm2go.Inv_1371_4)
+		module().enqueueFree(1371, 4, buf, wasm2go.Inv_1371_4)
 		h.ptr = 0
 	}
 }
@@ -320954,7 +321055,7 @@ func (h *SimpleGraphPropertyDefinitionProto) ValueExpressionSql() (string, error
 func (h *SimpleGraphPropertyDefinitionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1372, 20, buf, wasm2go.Inv_1372_20)
+		module().enqueueFree(1372, 20, buf, wasm2go.Inv_1372_20)
 		h.ptr = 0
 	}
 }
@@ -321156,7 +321257,7 @@ func (h *SimpleModel) NumOutputs() (uint64, error) {
 func (h *SimpleModel) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1373, 14, buf, wasm2go.Inv_1373_14)
+		module().enqueueFree(1373, 14, buf, wasm2go.Inv_1373_14)
 		h.ptr = 0
 	}
 }
@@ -321411,7 +321512,7 @@ func (h *SimpleModelProto) SetId(value int64) error {
 func (h *SimpleModelProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1374, 27, buf, wasm2go.Inv_1374_27)
+		module().enqueueFree(1374, 27, buf, wasm2go.Inv_1374_27)
 		h.ptr = 0
 	}
 }
@@ -321604,7 +321705,7 @@ func (h *SimplePropertyGraph) NamePath() ([]string, error) {
 func (h *SimplePropertyGraph) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1375, 14, buf, wasm2go.Inv_1375_14)
+		module().enqueueFree(1375, 14, buf, wasm2go.Inv_1375_14)
 		h.ptr = 0
 	}
 }
@@ -321971,7 +322072,7 @@ func (h *SimplePropertyGraphProto) SetAllocatedName() (string, error) {
 func (h *SimplePropertyGraphProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1376, 39, buf, wasm2go.Inv_1376_39)
+		module().enqueueFree(1376, 39, buf, wasm2go.Inv_1376_39)
 		h.ptr = 0
 	}
 }
@@ -322064,7 +322165,7 @@ func (h *SimpleSQLView) ViewQuery() (ResolvedScanNode, error) {
 func (h *SimpleSQLView) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1377, 7, buf, wasm2go.Inv_1377_7)
+		module().enqueueFree(1377, 7, buf, wasm2go.Inv_1377_7)
 		h.ptr = 0
 	}
 }
@@ -322127,7 +322228,7 @@ func (h *SimpleSequence) Serialize(proto *SimpleSequenceProto) error {
 func (h *SimpleSequence) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1378, 4, buf, wasm2go.Inv_1378_4)
+		module().enqueueFree(1378, 4, buf, wasm2go.Inv_1378_4)
 		h.ptr = 0
 	}
 }
@@ -322321,7 +322422,7 @@ func (h *SimpleSequenceProto) SetAllocatedName() (string, error) {
 func (h *SimpleSequenceProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1379, 20, buf, wasm2go.Inv_1379_20)
+		module().enqueueFree(1379, 20, buf, wasm2go.Inv_1379_20)
 		h.ptr = 0
 	}
 }
@@ -322663,7 +322764,7 @@ func (h *SimpleTable) SetIsValueTable(value bool) error {
 func (h *SimpleTable) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1380, 27, buf, wasm2go.Inv_1380_27)
+		module().enqueueFree(1380, 27, buf, wasm2go.Inv_1380_27)
 		h.ptr = 0
 	}
 }
@@ -323202,7 +323303,7 @@ func (h *SimpleTableProto) UnsafeArenaSetAllocatedAnonymizationInfo(value *Simpl
 func (h *SimpleTableProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1381, 62, buf, wasm2go.Inv_1381_62)
+		module().enqueueFree(1381, 62, buf, wasm2go.Inv_1381_62)
 		h.ptr = 0
 	}
 }
@@ -323581,7 +323682,7 @@ func (h *SimpleValue) StringValue() (string, error) {
 func (h *SimpleValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1383, 20, buf, wasm2go.Inv_1383_20)
+		module().enqueueFree(1383, 20, buf, wasm2go.Inv_1383_20)
 		h.ptr = 0
 	}
 }
@@ -323909,7 +324010,7 @@ func (h *SimpleValueProto) ValueCase() (SimpleValueProto_ValueCase, error) {
 func (h *SimpleValueProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1384, 37, buf, wasm2go.Inv_1384_37)
+		module().enqueueFree(1384, 37, buf, wasm2go.Inv_1384_37)
 		h.ptr = 0
 	}
 }
@@ -323997,7 +324098,7 @@ func (h *SimulatedClock) TimeNow() (*Time, error) {
 func (h *SimulatedClock) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1449, 4, buf, wasm2go.Inv_1449_4)
+		module().enqueueFree(1449, 4, buf, wasm2go.Inv_1449_4)
 		h.ptr = 0
 	}
 }
@@ -324157,7 +324258,7 @@ func (h *StringTypeParametersProto) SetMaxLength(value int64) error {
 func (h *StringTypeParametersProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1385, 17, buf, wasm2go.Inv_1385_17)
+		module().enqueueFree(1385, 17, buf, wasm2go.Inv_1385_17)
 		h.ptr = 0
 	}
 }
@@ -324334,7 +324435,7 @@ func (h *StructAnnotationMap) NumFields() (int32, error) {
 func (h *StructAnnotationMap) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1386, 13, buf, wasm2go.Inv_1386_13)
+		module().enqueueFree(1386, 13, buf, wasm2go.Inv_1386_13)
 		h.ptr = 0
 	}
 }
@@ -324543,7 +324644,7 @@ func (h *StructFieldProto) UnsafeArenaSetAllocatedFieldType(value *TypeProto) er
 func (h *StructFieldProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1387, 22, buf, wasm2go.Inv_1387_22)
+		module().enqueueFree(1387, 22, buf, wasm2go.Inv_1387_22)
 		h.ptr = 0
 	}
 }
@@ -324972,7 +325073,7 @@ func (h *StructTypeProto) MutableField(index int32) (*StructFieldProto, error) {
 func (h *StructTypeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1389, 13, buf, wasm2go.Inv_1389_13)
+		module().enqueueFree(1389, 13, buf, wasm2go.Inv_1389_13)
 		h.ptr = 0
 	}
 }
@@ -325464,7 +325565,7 @@ func (h *TVFArgumentProto) UnsafeArenaSetAllocatedScalarArgument(value *ValueWit
 func (h *TVFArgumentProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1390, 56, buf, wasm2go.Inv_1390_56)
+		module().enqueueFree(1390, 56, buf, wasm2go.Inv_1390_56)
 		h.ptr = 0
 	}
 }
@@ -325540,7 +325641,7 @@ func (h *TVFConnectionArgument) Connection() (ConnectionNode, error) {
 func (h *TVFConnectionArgument) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1391, 3, buf, wasm2go.Inv_1391_3)
+		module().enqueueFree(1391, 3, buf, wasm2go.Inv_1391_3)
 		h.ptr = 0
 	}
 }
@@ -325734,7 +325835,7 @@ func (h *TVFConnectionProto) SetAllocatedName() (string, error) {
 func (h *TVFConnectionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1392, 20, buf, wasm2go.Inv_1392_20)
+		module().enqueueFree(1392, 20, buf, wasm2go.Inv_1392_20)
 		h.ptr = 0
 	}
 }
@@ -325814,7 +325915,7 @@ func (h *TVFDescriptorArgument) ColumnNames() ([]string, error) {
 func (h *TVFDescriptorArgument) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1393, 3, buf, wasm2go.Inv_1393_3)
+		module().enqueueFree(1393, 3, buf, wasm2go.Inv_1393_3)
 		h.ptr = 0
 	}
 }
@@ -325949,7 +326050,7 @@ func (h *TVFDescriptorProto) MutableColumnName(index int32) (string, error) {
 func (h *TVFDescriptorProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1394, 13, buf, wasm2go.Inv_1394_13)
+		module().enqueueFree(1394, 13, buf, wasm2go.Inv_1394_13)
 		h.ptr = 0
 	}
 }
@@ -326019,7 +326120,7 @@ func (h *TVFGraphArgument) Graph() (PropertyGraphNode, error) {
 func (h *TVFGraphArgument) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1395, 3, buf, wasm2go.Inv_1395_3)
+		module().enqueueFree(1395, 3, buf, wasm2go.Inv_1395_3)
 		h.ptr = 0
 	}
 }
@@ -326213,7 +326314,7 @@ func (h *TVFGraphProto) SetAllocatedName() (string, error) {
 func (h *TVFGraphProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1396, 20, buf, wasm2go.Inv_1396_20)
+		module().enqueueFree(1396, 20, buf, wasm2go.Inv_1396_20)
 		h.ptr = 0
 	}
 }
@@ -326484,7 +326585,7 @@ func (h *TVFInputArgumentType) SetScalarExpr(expr ResolvedExprNode) error {
 func (h *TVFInputArgumentType) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1397, 21, buf, wasm2go.Inv_1397_21)
+		module().enqueueFree(1397, 21, buf, wasm2go.Inv_1397_21)
 		h.ptr = 0
 	}
 }
@@ -326560,7 +326661,7 @@ func (h *TVFModelArgument) Model() (ModelNode, error) {
 func (h *TVFModelArgument) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1398, 3, buf, wasm2go.Inv_1398_3)
+		module().enqueueFree(1398, 3, buf, wasm2go.Inv_1398_3)
 		h.ptr = 0
 	}
 }
@@ -326754,7 +326855,7 @@ func (h *TVFModelProto) SetAllocatedName() (string, error) {
 func (h *TVFModelProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1399, 20, buf, wasm2go.Inv_1399_20)
+		module().enqueueFree(1399, 20, buf, wasm2go.Inv_1399_20)
 		h.ptr = 0
 	}
 }
@@ -326947,7 +327048,7 @@ func (h *TVFRelation) NumColumns() (int32, error) {
 func (h *TVFRelation) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1400, 10, buf, wasm2go.Inv_1400_10)
+		module().enqueueFree(1400, 10, buf, wasm2go.Inv_1400_10)
 		h.ptr = 0
 	}
 }
@@ -327389,7 +327490,7 @@ func (h *TVFRelationColumnProto) UnsafeArenaSetAllocatedTypeParseLocationRange(v
 func (h *TVFRelationColumnProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1401, 50, buf, wasm2go.Inv_1401_50)
+		module().enqueueFree(1401, 50, buf, wasm2go.Inv_1401_50)
 		h.ptr = 0
 	}
 }
@@ -327556,7 +327657,7 @@ func (h *TVFRelationProto) SetIsValueTable(value bool) error {
 func (h *TVFRelationProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1402, 17, buf, wasm2go.Inv_1402_17)
+		module().enqueueFree(1402, 17, buf, wasm2go.Inv_1402_17)
 		h.ptr = 0
 	}
 }
@@ -327740,7 +327841,7 @@ func (h *TVFSignature) ResultTableSchema() (TableNode, error) {
 func (h *TVFSignature) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1403, 10, buf, wasm2go.Inv_1403_10)
+		module().enqueueFree(1403, 10, buf, wasm2go.Inv_1403_10)
 		h.ptr = 0
 	}
 }
@@ -327875,7 +327976,7 @@ func (h *TVFSignatureOptionsProto) MutableAdditionalDeprecationWarning(index int
 func (h *TVFSignatureOptionsProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1404, 13, buf, wasm2go.Inv_1404_13)
+		module().enqueueFree(1404, 13, buf, wasm2go.Inv_1404_13)
 		h.ptr = 0
 	}
 }
@@ -328226,7 +328327,7 @@ func (h *TVFSignatureProto) UnsafeArenaSetAllocatedOutputTableSchema(value *Tabl
 func (h *TVFSignatureProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1405, 39, buf, wasm2go.Inv_1405_39)
+		module().enqueueFree(1405, 39, buf, wasm2go.Inv_1405_39)
 		h.ptr = 0
 	}
 }
@@ -328448,7 +328549,7 @@ func NewTableFromImpl(impl TableCallback) (*Table, error) {
 func (h *Table) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1406, 14, buf, wasm2go.Inv_1406_14)
+		module().enqueueFree(1406, 14, buf, wasm2go.Inv_1406_14)
 		h.ptr = 0
 	}
 }
@@ -328520,7 +328621,7 @@ func (h *TableFromProto) Init(descriptor *Descriptor, typeFactory *TypeFactory, 
 func (h *TableFromProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1407, 2, buf, wasm2go.Inv_1407_2)
+		module().enqueueFree(1407, 2, buf, wasm2go.Inv_1407_2)
 		h.ptr = 0
 	}
 }
@@ -328737,7 +328838,7 @@ func (h *TableRefProto) SetSerializationId(value int64) error {
 func (h *TableRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1408, 23, buf, wasm2go.Inv_1408_23)
+		module().enqueueFree(1408, 23, buf, wasm2go.Inv_1408_23)
 		h.ptr = 0
 	}
 }
@@ -329383,7 +329484,7 @@ func NewTableValuedFunctionFromImpl4(impl TableValuedFunctionCallback, functionN
 func (h *TableValuedFunction) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1409, 29, buf, wasm2go.Inv_1409_29)
+		module().enqueueFree(1409, 29, buf, wasm2go.Inv_1409_29)
 		h.ptr = 0
 	}
 }
@@ -329546,7 +329647,7 @@ func (h *TableValuedFunctionOptionsProto) UsesUpperCaseSqlName() (bool, error) {
 func (h *TableValuedFunctionOptionsProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1410, 17, buf, wasm2go.Inv_1410_17)
+		module().enqueueFree(1410, 17, buf, wasm2go.Inv_1410_17)
 		h.ptr = 0
 	}
 }
@@ -330239,7 +330340,7 @@ func (h *TableValuedFunctionProto) Volatility() (FunctionEnums_Volatility, error
 func (h *TableValuedFunctionProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1411, 79, buf, wasm2go.Inv_1411_79)
+		module().enqueueFree(1411, 79, buf, wasm2go.Inv_1411_79)
 		h.ptr = 0
 	}
 }
@@ -330381,7 +330482,7 @@ func (h *TableValuedFunctionRefProto) SetAllocatedName() (string, error) {
 func (h *TableValuedFunctionRefProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1412, 14, buf, wasm2go.Inv_1412_14)
+		module().enqueueFree(1412, 14, buf, wasm2go.Inv_1412_14)
 		h.ptr = 0
 	}
 }
@@ -330594,7 +330695,7 @@ func (h *TemplatedSQLTVF) SetResolutionCatalog(resolutionCatalog CatalogNode) er
 func (h *TemplatedSQLTVF) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1413, 7, buf, wasm2go.Inv_1413_7)
+		module().enqueueFree(1413, 7, buf, wasm2go.Inv_1413_7)
 		h.ptr = 0
 	}
 }
@@ -330906,7 +331007,7 @@ func (h *TimeValue) Second() (int32, error) {
 func (h *TimeValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1414, 19, buf, wasm2go.Inv_1414_19)
+		module().enqueueFree(1414, 19, buf, wasm2go.Inv_1414_19)
 		h.ptr = 0
 	}
 }
@@ -331067,7 +331168,7 @@ func (h *TimestampPicosValue) ToString(timezone *TimeZone) (string, error) {
 func (h *TimestampPicosValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1415, 11, buf, wasm2go.Inv_1415_11)
+		module().enqueueFree(1415, 11, buf, wasm2go.Inv_1415_11)
 		h.ptr = 0
 	}
 }
@@ -331180,7 +331281,7 @@ func (h *TimestampTypeParametersProto) SetPrecision(value int64) error {
 func (h *TimestampTypeParametersProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1416, 11, buf, wasm2go.Inv_1416_11)
+		module().enqueueFree(1416, 11, buf, wasm2go.Inv_1416_11)
 		h.ptr = 0
 	}
 }
@@ -331307,7 +331408,7 @@ func (h *TypeDeserializer) TypeFactory() (*TypeFactory, error) {
 func (h *TypeDeserializer) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1418, 5, buf, wasm2go.Inv_1418_5)
+		module().enqueueFree(1418, 5, buf, wasm2go.Inv_1418_5)
 		h.ptr = 0
 	}
 }
@@ -332242,7 +332343,7 @@ func (h *TypeFactory) NestingDepthLimit() (int32, error) {
 func (h *TypeFactory) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1419, 62, buf, wasm2go.Inv_1419_62)
+		module().enqueueFree(1419, 62, buf, wasm2go.Inv_1419_62)
 		h.ptr = 0
 	}
 }
@@ -332281,7 +332382,7 @@ func newTypeFactoryBaseNoFinalizer(ptr uint64) *TypeFactoryBase {
 func (h *TypeFactoryBase) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1420, 0, buf, wasm2go.Inv_1420_0)
+		module().enqueueFree(1420, 0, buf, wasm2go.Inv_1420_0)
 		h.ptr = 0
 	}
 }
@@ -332424,7 +332525,7 @@ func (h *TypeModifiers) TypeParameters() (*TypeParameters, error) {
 func (h *TypeModifiers) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1421, 10, buf, wasm2go.Inv_1421_10)
+		module().enqueueFree(1421, 10, buf, wasm2go.Inv_1421_10)
 		h.ptr = 0
 	}
 }
@@ -332648,7 +332749,7 @@ func (h *TypeModifiersProto) UnsafeArenaSetAllocatedTypeParameters(value *TypePa
 func (h *TypeModifiersProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1422, 24, buf, wasm2go.Inv_1422_24)
+		module().enqueueFree(1422, 24, buf, wasm2go.Inv_1422_24)
 		h.ptr = 0
 	}
 }
@@ -332746,7 +332847,7 @@ func (h *TypeParameterValue) IsSpecialLiteral() (bool, error) {
 func (h *TypeParameterValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1423, 5, buf, wasm2go.Inv_1423_5)
+		module().enqueueFree(1423, 5, buf, wasm2go.Inv_1423_5)
 		h.ptr = 0
 	}
 }
@@ -333050,7 +333151,7 @@ func (h *TypeParameters) TimestampTypeParameters() (*TimestampTypeParametersProt
 func (h *TypeParameters) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1424, 21, buf, wasm2go.Inv_1424_21)
+		module().enqueueFree(1424, 21, buf, wasm2go.Inv_1424_21)
 		h.ptr = 0
 	}
 }
@@ -333468,7 +333569,7 @@ func (h *TypeParametersProto) UnsafeArenaSetAllocatedTimestampTypeParameters(val
 func (h *TypeParametersProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1425, 47, buf, wasm2go.Inv_1425_47)
+		module().enqueueFree(1425, 47, buf, wasm2go.Inv_1425_47)
 		h.ptr = 0
 	}
 }
@@ -334290,7 +334391,7 @@ func (h *TypeProto) UnsafeArenaSetAllocatedStructType(value *StructTypeProto) er
 func (h *TypeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1426, 95, buf, wasm2go.Inv_1426_95)
+		module().enqueueFree(1426, 95, buf, wasm2go.Inv_1426_95)
 		h.ptr = 0
 	}
 }
@@ -334349,7 +334450,7 @@ func (h *Unparser) Println(s string) error {
 func (h *Unparser) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1442, 4, buf, wasm2go.Inv_1442_4)
+		module().enqueueFree(1442, 4, buf, wasm2go.Inv_1442_4)
 		h.ptr = 0
 	}
 }
@@ -334554,7 +334655,7 @@ func (h *UnsafeArena) BytesUntilNextAllocation() (uint64, error) {
 func (h *UnsafeArena) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1450, 15, buf, wasm2go.Inv_1450_15)
+		module().enqueueFree(1450, 15, buf, wasm2go.Inv_1450_15)
 		h.ptr = 0
 	}
 }
@@ -334687,7 +334788,7 @@ func (h *UuidValue) ToString() (string, error) {
 func (h *UuidValue) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1427, 8, buf, wasm2go.Inv_1427_8)
+		module().enqueueFree(1427, 8, buf, wasm2go.Inv_1427_8)
 		h.ptr = 0
 	}
 }
@@ -336965,7 +337066,7 @@ func (h *Value) UuidValue() (*UuidValue, error) {
 func (h *Value) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1428, 153, buf, wasm2go.Inv_1428_153)
+		module().enqueueFree(1428, 153, buf, wasm2go.Inv_1428_153)
 		h.ptr = 0
 	}
 }
@@ -337023,7 +337124,7 @@ func newValueContentNoFinalizer(ptr uint64) *ValueContent {
 func (h *ValueContent) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1429, 0, buf, wasm2go.Inv_1429_0)
+		module().enqueueFree(1429, 0, buf, wasm2go.Inv_1429_0)
 		h.ptr = 0
 	}
 }
@@ -338379,7 +338480,7 @@ func (h *ValueProto) ValueCase() (ValueProto_ValueCase, error) {
 func (h *ValueProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1430, 160, buf, wasm2go.Inv_1430_160)
+		module().enqueueFree(1430, 160, buf, wasm2go.Inv_1430_160)
 		h.ptr = 0
 	}
 }
@@ -338514,7 +338615,7 @@ func (h *ValueProto_Array) MutableElement(index int32) (*ValueProto, error) {
 func (h *ValueProto_Array) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1431, 13, buf, wasm2go.Inv_1431_13)
+		module().enqueueFree(1431, 13, buf, wasm2go.Inv_1431_13)
 		h.ptr = 0
 	}
 }
@@ -338650,7 +338751,7 @@ func (h *ValueProto_Datetime) SetNanos(value int32) error {
 func (h *ValueProto_Datetime) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1432, 14, buf, wasm2go.Inv_1432_14)
+		module().enqueueFree(1432, 14, buf, wasm2go.Inv_1432_14)
 		h.ptr = 0
 	}
 }
@@ -338785,7 +338886,7 @@ func (h *ValueProto_Map) MutableEntry(index int32) (*ValueProto_MapEntry, error)
 func (h *ValueProto_Map) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1433, 13, buf, wasm2go.Inv_1433_13)
+		module().enqueueFree(1433, 13, buf, wasm2go.Inv_1433_13)
 		h.ptr = 0
 	}
 }
@@ -339009,7 +339110,7 @@ func (h *ValueProto_MapEntry) Value() (*ValueProto, error) {
 func (h *ValueProto_MapEntry) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1434, 24, buf, wasm2go.Inv_1434_24)
+		module().enqueueFree(1434, 24, buf, wasm2go.Inv_1434_24)
 		h.ptr = 0
 	}
 }
@@ -339233,7 +339334,7 @@ func (h *ValueProto_Range) UnsafeArenaSetAllocatedStart(value *ValueProto) error
 func (h *ValueProto_Range) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1435, 24, buf, wasm2go.Inv_1435_24)
+		module().enqueueFree(1435, 24, buf, wasm2go.Inv_1435_24)
 		h.ptr = 0
 	}
 }
@@ -339368,7 +339469,7 @@ func (h *ValueProto_Struct) MutableField(index int32) (*ValueProto, error) {
 func (h *ValueProto_Struct) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1436, 13, buf, wasm2go.Inv_1436_13)
+		module().enqueueFree(1436, 13, buf, wasm2go.Inv_1436_13)
 		h.ptr = 0
 	}
 }
@@ -339504,7 +339605,7 @@ func (h *ValueProto_TimestampPicos) SetSeconds(value int64) error {
 func (h *ValueProto_TimestampPicos) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1437, 14, buf, wasm2go.Inv_1437_14)
+		module().enqueueFree(1437, 14, buf, wasm2go.Inv_1437_14)
 		h.ptr = 0
 	}
 }
@@ -339728,7 +339829,7 @@ func (h *ValueWithTypeProto) Value() (*ValueProto, error) {
 func (h *ValueWithTypeProto) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1438, 24, buf, wasm2go.Inv_1438_24)
+		module().enqueueFree(1438, 24, buf, wasm2go.Inv_1438_24)
 		h.ptr = 0
 	}
 }
@@ -339782,7 +339883,7 @@ func (h *VariadicFunctionSignatureExpander) Rewrite(options *AnalyzerOptions, in
 func (h *VariadicFunctionSignatureExpander) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1439, 2, buf, wasm2go.Inv_1439_2)
+		module().enqueueFree(1439, 2, buf, wasm2go.Inv_1439_2)
 		h.ptr = 0
 	}
 }
@@ -339854,7 +339955,7 @@ func (h *WarningSink) Warnings() error {
 func (h *WarningSink) free() {
 	if h.ptr != 0 {
 		buf := pbAppendHandle(nil, 1, h.ptr)
-		module().invoke(1440, 3, buf, wasm2go.Inv_1440_3)
+		module().enqueueFree(1440, 3, buf, wasm2go.Inv_1440_3)
 		h.ptr = 0
 	}
 }
