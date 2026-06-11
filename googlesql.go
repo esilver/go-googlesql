@@ -118324,6 +118324,7 @@ func newFixedOutputSchemaTVF(ptr uint64) *FixedOutputSchemaTVF {
 	h := &FixedOutputSchemaTVF{
 		TableValuedFunction: newTableValuedFunctionNoFinalizer(ptr),
 	}
+	h.TableValuedFunction.setKeepAlive(h)
 	runtime.SetFinalizer(h, (*FixedOutputSchemaTVF).free)
 	return h
 }
@@ -118332,6 +118333,7 @@ func newFixedOutputSchemaTVFNoFinalizer(ptr uint64) *FixedOutputSchemaTVF {
 	h := &FixedOutputSchemaTVF{
 		TableValuedFunction: newTableValuedFunctionNoFinalizer(ptr),
 	}
+	h.TableValuedFunction.setKeepAlive(h)
 	return h
 }
 
@@ -118593,6 +118595,7 @@ func newForwardInputSchemaToOutputSchemaTVF(ptr uint64) *ForwardInputSchemaToOut
 	h := &ForwardInputSchemaToOutputSchemaTVF{
 		TableValuedFunction: newTableValuedFunctionNoFinalizer(ptr),
 	}
+	h.TableValuedFunction.setKeepAlive(h)
 	runtime.SetFinalizer(h, (*ForwardInputSchemaToOutputSchemaTVF).free)
 	return h
 }
@@ -118601,6 +118604,7 @@ func newForwardInputSchemaToOutputSchemaTVFNoFinalizer(ptr uint64) *ForwardInput
 	h := &ForwardInputSchemaToOutputSchemaTVF{
 		TableValuedFunction: newTableValuedFunctionNoFinalizer(ptr),
 	}
+	h.TableValuedFunction.setKeepAlive(h)
 	return h
 }
 
@@ -313215,6 +313219,7 @@ func newSQLTableValuedFunction(ptr uint64) *SQLTableValuedFunction {
 	h := &SQLTableValuedFunction{
 		TableValuedFunction: newTableValuedFunctionNoFinalizer(ptr),
 	}
+	h.TableValuedFunction.setKeepAlive(h)
 	runtime.SetFinalizer(h, (*SQLTableValuedFunction).free)
 	return h
 }
@@ -313223,6 +313228,7 @@ func newSQLTableValuedFunctionNoFinalizer(ptr uint64) *SQLTableValuedFunction {
 	h := &SQLTableValuedFunction{
 		TableValuedFunction: newTableValuedFunctionNoFinalizer(ptr),
 	}
+	h.TableValuedFunction.setKeepAlive(h)
 	return h
 }
 
@@ -330511,6 +330517,7 @@ func newTemplatedSQLTVF(ptr uint64) *TemplatedSQLTVF {
 	h := &TemplatedSQLTVF{
 		TableValuedFunction: newTableValuedFunctionNoFinalizer(ptr),
 	}
+	h.TableValuedFunction.setKeepAlive(h)
 	runtime.SetFinalizer(h, (*TemplatedSQLTVF).free)
 	return h
 }
@@ -330519,6 +330526,7 @@ func newTemplatedSQLTVFNoFinalizer(ptr uint64) *TemplatedSQLTVF {
 	h := &TemplatedSQLTVF{
 		TableValuedFunction: newTableValuedFunctionNoFinalizer(ptr),
 	}
+	h.TableValuedFunction.setKeepAlive(h)
 	return h
 }
 

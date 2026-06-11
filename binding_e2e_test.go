@@ -758,6 +758,104 @@ func TestE2E_FixedOutputSchemaTVF(t *testing.T) {
 	}
 }
 
+// TestE2E_FixedOutputSchemaTVF_ScalarArgsFromParserAST matches the
+// googlesqlite call-site path: build a FixedOutputSchemaTVF with scalar
+// arguments, alias it into a SimpleCatalog with AddTableValuedFunction2,
+// parse separately, then analyze with AnalyzeStatementFromParserAST.
+// This previously crashed in the wasm2go binding/runtime while resolving
+// SELECT ... FROM add_one(41).
+func TestE2E_FixedOutputSchemaTVF_ScalarArgsFromParserAST(t *testing.T) {
+	t.Cleanup(gc)
+
+	catalog, opts, tf, _ := setupAnalyzer(t)
+
+	int64Type, err := tf.GetInt64()
+	if err != nil {
+		t.Fatalf("GetInt64: %v", err)
+	}
+	resultSchema, err := googlesql.NewTVFRelation([]*googlesql.TVFSchemaColumn{
+		{Name: "y", Type_: int64Type},
+	})
+	if err != nil {
+		t.Fatalf("NewTVFRelation: %v", err)
+	}
+	resultArg, err := googlesql.NewFunctionArgumentTypeRelationWithSchema(resultSchema, false)
+	if err != nil {
+		t.Fatalf("NewFunctionArgumentTypeRelationWithSchema: %v", err)
+	}
+	argOpts, err := googlesql.NewFunctionArgumentTypeOptions()
+	if err != nil {
+		t.Fatalf("NewFunctionArgumentTypeOptions: %v", err)
+	}
+	int64Arg, err := googlesql.NewFunctionArgumentType(int64Type, argOpts, -1)
+	if err != nil {
+		t.Fatalf("NewFunctionArgumentType: %v", err)
+	}
+	sig, err := googlesql.NewFunctionSignature3(
+		resultArg,
+		[]*googlesql.FunctionArgumentType{int64Arg},
+		0,
+	)
+	if err != nil {
+		t.Fatalf("NewFunctionSignature3: %v", err)
+	}
+	buildTVF := func() (*googlesql.TableValuedFunction, error) {
+		tvf, err := googlesql.NewFixedOutputSchemaTVF(
+			[]string{"add_one"},
+			sig,
+			resultSchema,
+			&googlesql.TableValuedFunctionOptions{},
+		)
+		if err != nil {
+			return nil, err
+		}
+		return tvf.TableValuedFunction, nil
+	}
+	tvf, err := buildTVF()
+	if err != nil {
+		t.Fatalf("NewFixedOutputSchemaTVF: %v", err)
+	}
+	gc()
+	if err := catalog.AddTableValuedFunction2("add_one", tvf); err != nil {
+		t.Fatalf("AddTableValuedFunction2: %v", err)
+	}
+
+	parserOpts, err := googlesql.NewParserOptions()
+	if err != nil {
+		t.Fatalf("NewParserOptions: %v", err)
+	}
+	parsed, err := googlesql.ParseStatement("SELECT y FROM add_one(41)", parserOpts)
+	if err != nil {
+		t.Fatalf("ParseStatement: %v", err)
+	}
+	stmt, err := parsed.Statement()
+	if err != nil {
+		t.Fatalf("Statement: %v", err)
+	}
+	out, err := googlesql.AnalyzeStatementFromParserAST(
+		stmt,
+		opts,
+		"SELECT y FROM add_one(41)",
+		catalog,
+		tf,
+	)
+	if err != nil {
+		t.Fatalf("AnalyzeStatementFromParserAST(add_one): %v", err)
+	}
+	resolved, err := out.ResolvedStatement()
+	if err != nil {
+		t.Fatalf("ResolvedStatement: %v", err)
+	}
+	qs, ok := resolved.(*googlesql.ResolvedQueryStmt)
+	if !ok {
+		t.Fatalf("expected *ResolvedQueryStmt, got %T", resolved)
+	}
+	size, _ := qs.OutputColumnListSize()
+	if size != 1 {
+		t.Errorf("OutputColumnListSize = %d, want 1", size)
+	}
+}
+
 // TestE2E_MultiCatalog_MissingTable confirms the analyzer routes
 // errors through the MultiCatalog: a query referencing a table that
 // exists in NEITHER child must fail.
