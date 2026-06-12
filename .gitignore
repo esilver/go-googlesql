@@ -28,6 +28,7 @@ go.work.sum
 .gocache/
 .gomodcache/
 .golangci-cache/
+.upstream/
 
 # env file
 .env

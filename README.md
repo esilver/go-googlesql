@@ -161,13 +161,15 @@ You can re-run the upstream attestation check yourself, locally and
 the upstream release artifact:
 
 ```sh
-make verify
+make googlesql
 ```
 
-The Makefile target fetches the upstream SLSA build-attestation bundle
-from the public `/repos/.../attestations/sha256:<digest>` API
-(anonymously) and hands it to `gh attestation verify --bundle`. The
-`--signer-workflow` flag pins the trusted signer to
+The Makefile target downloads the upstream bridge into `.upstream/`
+without replacing this fork's patched `googlesql.go`, then fetches the
+upstream SLSA build-attestation bundle from the public
+`/repos/.../attestations/sha256:<digest>` API (anonymously) and hands it
+to `gh attestation verify --bundle`. The `--signer-workflow` flag pins
+the trusted signer to
 `goccy/googlesql-wasm/.github/workflows/build.yml`, so only files
 produced by that workflow verify successfully.
 
@@ -176,14 +178,15 @@ Both checks run unauthenticated — no `gh auth login`, no `GH_TOKEN` /
 <https://zenn.dev/shunsuke_suzuki/articles/gh-at-verify-without-access-token>).
 This fork patches `googlesql.go`, so the checked-in file cannot pass
 that upstream attestation check: its digest is intentionally not one of
-the signed release artifacts. `make verify` remains useful before
-applying local bridge patches or when checking a freshly downloaded
-upstream artifact. CI for this fork runs the Go test suite instead.
+the signed release artifacts. `make verify-upstream` remains useful when
+checking a freshly downloaded upstream artifact. CI for this fork runs
+the Go test suite instead.
 
 One regression test intentionally allocates past 2 GiB to protect the
 large-linear-memory bridge behavior. Use `go test -short ./...` for a
-low-memory local smoke run; full CI uses `go test ./...` and needs a
-runner with enough disk and memory for the generated bridge.
+low-memory local smoke run; default CI uses that short path. Run the
+full suite manually on a runner with enough disk and memory for the
+generated bridge when validating large-memory changes.
 
 ## Resource footprint
 

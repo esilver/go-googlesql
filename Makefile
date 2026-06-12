@@ -4,44 +4,50 @@ GOOGLESQL_WASM_WORKFLOW ?= goccy/googlesql-wasm/.github/workflows/build.yml
 
 BRIDGE_ASSET     := googlesql_wasm2go.go
 BRIDGE_FILE      := googlesql.go
+UPSTREAM_DIR     ?= .upstream
+UPSTREAM_BRIDGE_FILE := $(UPSTREAM_DIR)/$(BRIDGE_FILE)
 RELEASE_URL       = https://github.com/$(GOOGLESQL_WASM_REPO)/releases/download/$(GOOGLESQL_WASM_VERSION)
 ATTESTATION_API   = https://api.github.com/repos/$(GOOGLESQL_WASM_REPO)/attestations
 
-.PHONY: googlesql download verify test
+.PHONY: googlesql download-upstream verify-upstream download verify test
 
-## googlesql: refresh the wasm2go bridge from the upstream release
-## and verify its GitHub artifact attestation. Default to running
-## this whenever GOOGLESQL_WASM_VERSION bumps.
-googlesql: download verify
+## googlesql: fetch the upstream wasm2go bridge into .upstream/
+## and verify its GitHub artifact attestation. This target is
+## intentionally non-destructive: the checked-in googlesql.go carries
+## downstream bridge patches and must not be overwritten by default.
+googlesql: download-upstream verify-upstream
 
-## download: fetch the wasm2go-runtime bridge from the upstream
-## release and drop it in place at $(BRIDGE_FILE). The release
-## publishes it as $(BRIDGE_ASSET); the rename is purely cosmetic
-## (gh attestation verify matches by content digest).
-download:
-	curl -fSL --proto '=https' --tlsv1.2 -o $(BRIDGE_FILE) $(RELEASE_URL)/$(BRIDGE_ASSET)
+## download-upstream: fetch the wasm2go-runtime bridge from the upstream
+## release without replacing this fork's patched bridge.
+download-upstream:
+	mkdir -p $(UPSTREAM_DIR)
+	curl -fSL --proto '=https' --tlsv1.2 -o $(UPSTREAM_BRIDGE_FILE) $(RELEASE_URL)/$(BRIDGE_ASSET)
 
-## verify: confirm $(BRIDGE_FILE) carries a valid GitHub artifact
+## verify-upstream: confirm the downloaded upstream bridge carries a valid
 ## attestation signed by the upstream build.yml workflow. The
 ## attestation bundle is fetched anonymously from the public
 ## attestation API and verified offline via
 ## `gh attestation verify --bundle`. No GH access token is required.
-verify:
+verify-upstream:
 	@set -eu; \
+	test -f "$(UPSTREAM_BRIDGE_FILE)"; \
 	tmpdir=$$(mktemp -d); \
 	bundle=$$tmpdir/bundle.jsonl; \
 	trap 'rm -rf $$tmpdir' EXIT; \
-	digest=$$(shasum -a 256 $(BRIDGE_FILE) | awk '{print $$1}'); \
-	echo "==> fetching attestation bundle for $(BRIDGE_FILE) (sha256:$$digest)"; \
+	digest=$$(shasum -a 256 $(UPSTREAM_BRIDGE_FILE) | awk '{print $$1}'); \
+	echo "==> fetching attestation bundle for $(UPSTREAM_BRIDGE_FILE) (sha256:$$digest)"; \
 	curl -fsSL --proto '=https' --tlsv1.2 \
 	  "$(ATTESTATION_API)/sha256:$$digest" \
 	  | jq -c '.attestations[].bundle' > $$bundle; \
-	echo "==> verifying $(BRIDGE_FILE)"; \
-	GH_TOKEN= GITHUB_TOKEN= gh attestation verify "$(BRIDGE_FILE)" \
+	echo "==> verifying $(UPSTREAM_BRIDGE_FILE)"; \
+	GH_TOKEN= GITHUB_TOKEN= gh attestation verify "$(UPSTREAM_BRIDGE_FILE)" \
 	  -R $(GOOGLESQL_WASM_REPO) \
 	  --bundle $$bundle \
 	  --signer-workflow $(GOOGLESQL_WASM_WORKFLOW)
 
+download: download-upstream
+verify: verify-upstream
+
 ## test: run the Go test suite.
 test:
-	go test ./...
+	go test -short ./...
