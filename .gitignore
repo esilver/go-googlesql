@@ -24,6 +24,11 @@ profile.cov
 go.work
 go.work.sum
 
+# Local Go/tool caches
+.gocache/
+.gomodcache/
+.golangci-cache/
+
 # env file
 .env
 

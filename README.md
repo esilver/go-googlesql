@@ -26,12 +26,12 @@ native toolchain, no embedded wasm runtime, just a regular Go library.
   embedded interpreter or JIT — the engine is just Go code the toolchain
   compiles ahead of time. `CGO_ENABLED=0` builds, static linking, and
   cross-compilation all work without extra setup.
-- **Auto-generated end-to-end.** The Go bridge `googlesql.go` and the
-  transpiled engine under `internal/wasm2go/` are produced upstream by
-  [`goccy/wasm2go`](https://github.com/goccy/wasm2go) +
-  [`goccy/googlesql-wasm`](https://github.com/goccy/googlesql-wasm).
-  When upstream GoogleSQL ships a new revision, the artifacts here
-  follow without manual intervention.
+- **Generated engine, patched bridge.** The transpiled engine is
+  consumed through
+  [`github.com/goccy/googlesqlwasm2go`](https://github.com/goccy/googlesqlwasm2go).
+  This fork carries a small downstream patch set in `googlesql.go`
+  for bridge lifetime and large-memory behavior until those changes
+  can move upstream into the generator or release artifact.
 - **End-to-end provenance for upstream release artifacts.** Every
   upstream generated artifact is signed with
   [GitHub artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations).
@@ -57,7 +57,7 @@ go get github.com/goccy/go-googlesql
 ```
 
 The first build is heavy: the engine is shipped as transpiled Go
-source (~108 MB across `internal/wasm2go/`) plus a ~10 MB bridge in
+source via `github.com/goccy/googlesqlwasm2go` plus a large generated bridge in
 `googlesql.go`. Expect the Go compiler to need several gigabytes of
 RAM and a couple of minutes for a cold build. See
 [Resource footprint](#resource-footprint) for measured numbers and
@@ -164,33 +164,34 @@ the upstream release artifact:
 make verify
 ```
 
-The Makefile target does two things:
-
-1. `verify-release` runs `shasum -a 256 -c googlesql_wasm2go.sha256`
-   as a fast sanity check that every file extracted from
-   `googlesql_wasm2go.tar.gz` matches its manifest entry byte-for-byte.
-2. `verify-attestation` fetches the upstream SLSA build-attestation
-   bundle from the public `/repos/.../attestations/sha256:<digest>`
-   API (anonymously) and hands it to `gh attestation verify --bundle`
-   for every file listed in the manifest. The `--signer-workflow` flag
-   pins the trusted signer to
-   `goccy/googlesql-wasm/.github/workflows/build.yml`, so only files
-   produced by that workflow verify successfully.
+The Makefile target fetches the upstream SLSA build-attestation bundle
+from the public `/repos/.../attestations/sha256:<digest>` API
+(anonymously) and hands it to `gh attestation verify --bundle`. The
+`--signer-workflow` flag pins the trusted signer to
+`goccy/googlesql-wasm/.github/workflows/build.yml`, so only files
+produced by that workflow verify successfully.
 
 Both checks run unauthenticated — no `gh auth login`, no `GH_TOKEN` /
 `GITHUB_TOKEN` (technique from
 <https://zenn.dev/shunsuke_suzuki/articles/gh-at-verify-without-access-token>).
-Forks that patch `googlesql.go` cannot pass this upstream attestation
-check, because the patched file digest is not one of the signed release
-artifacts. CI for this fork runs the Go test suite instead.
+This fork patches `googlesql.go`, so the checked-in file cannot pass
+that upstream attestation check: its digest is intentionally not one of
+the signed release artifacts. `make verify` remains useful before
+applying local bridge patches or when checking a freshly downloaded
+upstream artifact. CI for this fork runs the Go test suite instead.
+
+One regression test intentionally allocates past 2 GiB to protect the
+large-linear-memory bridge behavior. Use `go test -short ./...` for a
+low-memory local smoke run; full CI uses `go test ./...` and needs a
+runner with enough disk and memory for the generated bridge.
 
 ## Resource footprint
 
-Because GoogleSQL ships as ahead-of-time transpiled Go (under
-`internal/wasm2go/`) instead of a wasm module plus a runtime, the cost
-shifts from process startup to the Go toolchain: compilation is
-heavier than a typical dependency, but in exchange `googlesql.Init`
-is fast and the steady-state heap is small.
+Because GoogleSQL ships as ahead-of-time transpiled Go (through the
+`github.com/goccy/googlesqlwasm2go` module) instead of a wasm module
+plus a runtime, the cost shifts from process startup to the Go
+toolchain: compilation is heavier than a typical dependency, but in
+exchange `googlesql.Init` is fast and the steady-state heap is small.
 
 All numbers below were measured on the same host:
 
