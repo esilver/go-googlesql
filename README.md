@@ -32,10 +32,12 @@ native toolchain, no embedded wasm runtime, just a regular Go library.
   [`goccy/googlesql-wasm`](https://github.com/goccy/googlesql-wasm).
   When upstream GoogleSQL ships a new revision, the artifacts here
   follow without manual intervention.
-- **End-to-end provenance.** Every released artifact is signed with
+- **End-to-end provenance for upstream release artifacts.** Every
+  upstream generated artifact is signed with
   [GitHub artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations).
-  CI re-verifies the in-tree files against the signed release on
-  every PR (see [Verifying provenance](#verifying-provenance)).
+  The `make verify` target can re-verify an unmodified bridge file
+  against the signed upstream release (see
+  [Verifying provenance](#verifying-provenance)).
 
 ## Status
 
@@ -155,7 +157,8 @@ _ = resolved
 ## Verifying provenance
 
 You can re-run the upstream attestation check yourself, locally and
-**without a GitHub access token**:
+**without a GitHub access token**, when `googlesql.go` is byte-for-byte
+the upstream release artifact:
 
 ```sh
 make verify
@@ -177,8 +180,9 @@ The Makefile target does two things:
 Both checks run unauthenticated — no `gh auth login`, no `GH_TOKEN` /
 `GITHUB_TOKEN` (technique from
 <https://zenn.dev/shunsuke_suzuki/articles/gh-at-verify-without-access-token>).
-CI runs the same target on every push to `main` and every pull
-request before running the test suite.
+Forks that patch `googlesql.go` cannot pass this upstream attestation
+check, because the patched file digest is not one of the signed release
+artifacts. CI for this fork runs the Go test suite instead.
 
 ## Resource footprint
 
