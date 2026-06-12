@@ -32,13 +32,16 @@ verify-upstream:
 	@set -eu; \
 	test -f "$(UPSTREAM_BRIDGE_FILE)"; \
 	tmpdir=$$(mktemp -d); \
+	response=$$tmpdir/attestations.json; \
 	bundle=$$tmpdir/bundle.jsonl; \
 	trap 'rm -rf $$tmpdir' EXIT; \
 	digest=$$(shasum -a 256 $(UPSTREAM_BRIDGE_FILE) | awk '{print $$1}'); \
 	echo "==> fetching attestation bundle for $(UPSTREAM_BRIDGE_FILE) (sha256:$$digest)"; \
 	curl -fsSL --proto '=https' --tlsv1.2 \
-	  "$(ATTESTATION_API)/sha256:$$digest" \
-	  | jq -c '.attestations[].bundle' > $$bundle; \
+	  "$(ATTESTATION_API)/sha256:$$digest" -o $$response; \
+	jq -e '.attestations | length > 0' $$response >/dev/null \
+	  || { echo "no upstream attestation found for sha256:$$digest" >&2; exit 1; }; \
+	jq -c '.attestations[].bundle' $$response > $$bundle; \
 	echo "==> verifying $(UPSTREAM_BRIDGE_FILE)"; \
 	GH_TOKEN= GITHUB_TOKEN= gh attestation verify "$(UPSTREAM_BRIDGE_FILE)" \
 	  -R $(GOOGLESQL_WASM_REPO) \
