@@ -1,5 +1,7 @@
 # go-googlesql
 
+> A fork of [goccy/go-googlesql](https://github.com/goccy/go-googlesql), the ZetaSQL/GoogleSQL analyzer bridge, carrying downstream memory-safety patches to the generated wasm2go bridge (see [UPSTREAMING.md](UPSTREAMING.md)). The original library is by [@goccy](https://github.com/goccy).
+
 [![CI](https://github.com/esilver/go-googlesql/actions/workflows/ci.yml/badge.svg)](https://github.com/esilver/go-googlesql/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/goccy/go-googlesql.svg)](https://pkg.go.dev/github.com/goccy/go-googlesql)
 
@@ -9,7 +11,7 @@ databases.
 
 ## Why this library
 
-I previously maintained
+`go-googlesql` is the pure-Go successor to
 [`goccy/go-zetasql`](https://github.com/goccy/go-zetasql), which
 exposed the same engine through cgo. The cgo dependency made
 cross-compilation, static linking, and overall portability painful.
