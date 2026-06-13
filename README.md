@@ -186,9 +186,10 @@ the Go test suite instead.
 
 One regression test intentionally allocates past 2 GiB to protect the
 large-linear-memory bridge behavior. Use `go test -short ./...` for a
-low-memory local smoke run; default CI uses that short path. Run the
-full suite manually on a runner with enough disk and memory for the
-generated bridge when validating large-memory changes.
+low-memory local smoke run; CI keeps that path for the broad suite and
+runs the large-memory regression as a separate resource-capped job. Run
+the full suite manually on a runner with enough disk and memory for the
+generated bridge when validating broader large-memory changes.
 
 ## Resource footprint
 
