@@ -1,6 +1,6 @@
 # go-googlesql
 
-[![CI](https://github.com/goccy/go-googlesql/actions/workflows/ci.yml/badge.svg)](https://github.com/goccy/go-googlesql/actions/workflows/ci.yml)
+[![CI](https://github.com/esilver/go-googlesql/actions/workflows/ci.yml/badge.svg)](https://github.com/esilver/go-googlesql/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/goccy/go-googlesql.svg)](https://pkg.go.dev/github.com/goccy/go-googlesql)
 
 Pure-Go bindings for [GoogleSQL](https://github.com/google/googlesql),
@@ -45,10 +45,12 @@ Tracks GoogleSQL revision
 [`36dd14aa0657ea299725504bc0f938732f58f380`](https://github.com/google/googlesql/commit/36dd14aa0657ea299725504bc0f938732f58f380)
 (2026-01-31). New upstream revisions are picked up here as they land.
 
-go-googlesql is used by
-[`goccy/googlesqlite`](https://github.com/goccy/googlesqlite) and
-[`goccy/bigquery-emulator`](https://github.com/goccy/bigquery-emulator),
-both of which have completed their migration onto it.
+The module path remains `github.com/goccy/go-googlesql` for compatibility.
+This fork is consumed by
+[`esilver/googlesqlite`](https://github.com/esilver/googlesqlite) and
+[`esilver/bigquery-emulator`](https://github.com/esilver/bigquery-emulator)
+through replace directives while the bridge-lifetime and large-memory fixes
+remain downstream.
 
 ## Installation
 
