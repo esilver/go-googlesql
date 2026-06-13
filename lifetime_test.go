@@ -22,13 +22,12 @@ import (
 //      regresses to shared internal state these tests will trip.
 //
 //   3. Runtime-conditional ownership transfer
-//      (`SimpleTable::AddColumn(Column*, bool is_owned)` etc.) is
-//      currently broken: `is_owned=true` does not clearPtr the
-//      wrapper, so the wrapper's finalizer issues a Free RPC against
-//      memory the parent's destructor will already reclaim. The
-//      `is_owned=true` test is therefore expected to FAIL until
-//      wasmify lands the runtime-gate emit. See
-//      issues/runtime-conditional-ownership.md.
+//      (`SimpleTable::AddColumn(Column*, bool is_owned)` etc.) must
+//      clearPtr the wrapper when `is_owned=true`, so the wrapper's
+//      finalizer does not issue a Free RPC against memory the parent's
+//      destructor will already reclaim. This landed (the bridge emits
+//      the runtime-gated clearPtr); the `is_owned=true` test guards
+//      that behavior so a regression fails loudly.
 //
 // Living in package googlesql (not googlesql_test) so the unexported
 // `ptr` field is observable, mirroring `internal_double_free_test.go`.
@@ -200,8 +199,9 @@ func TestLifetime_DescriptorPoolBuildFile_PoolPinsResult(t *testing.T) {
 		runtime.GC()
 	}
 
-	// Touch the borrowed FileDescriptor — would SIGSEGV / wazero
-	// "out of bounds" if the pool was finalised prematurely. Using
+	// Touch the borrowed FileDescriptor — would SIGSEGV / the
+	// transpiled wasm2go module would report "out of bounds" if the
+	// pool was finalised prematurely. Using
 	// DebugString instead of Name because the bridge has not bound
 	// FileDescriptor::name() yet (would surface as a separate
 	// follow-up); DebugString contains the file path so we can
@@ -328,7 +328,8 @@ func TestLifetime_RuntimeConditionalOwnership_AddColumnFalse(t *testing.T) {
 	// Phase 4 — allocator probe. If either branch had emitted a
 	// stray Free RPC against memory still owned elsewhere, the
 	// freelist would now be inconsistent and a fresh allocation
-	// would surface as wazero "out of bounds memory access".
+	// would surface as the transpiled wasm2go module reporting "out
+	// of bounds memory access".
 	for i := 0; i < 50; i++ {
 		probe, err := NewSimpleColumn("probe", "x", intType, false, true)
 		if err != nil {
@@ -347,16 +348,14 @@ func TestLifetime_RuntimeConditionalOwnership_AddColumnFalse(t *testing.T) {
 //   instance finalizer does not later issue a Free RPC against memory
 //   the table's destructor already reclaims.
 //
-// Today (before the wasmify fix) the wrapper does NOT clear col.ptr,
-// because `signatureMatches` in wasmify's gen-proto stage compares
-// user-supplied unqualified type names against clang's fully-qualified
-// qual_types byte-for-byte and fails to match — see
-// issues/runtime-conditional-ownership.md for the full diagnosis.
+// This landed: the wrapper clears col.ptr in the is_owned=true branch
+// (the bridge now matches the runtime-conditional overload and emits
+// the gated clearPtr).
 //
-// This test asserts the desired post-condition (col.ptr == 0). It also
-// drives the wasm allocator past the point a stray finalizer would
-// surface as "out of bounds memory access", giving a deterministic
-// crash signal when the bug is present.
+// This test asserts the post-condition (col.ptr == 0) so a regression
+// fails loudly. It also drives the wasm allocator past the point a
+// stray finalizer would surface as "out of bounds memory access",
+// giving a deterministic crash signal if the bug ever returns.
 func TestLifetime_RuntimeConditionalOwnership_AddColumnTrue(t *testing.T) {
 	ensureInit(t)
 	t.Cleanup(gcLocal)
@@ -387,9 +386,11 @@ func TestLifetime_RuntimeConditionalOwnership_AddColumnTrue(t *testing.T) {
 	// wrapper's ptr MUST be cleared. Otherwise the wrapper's per-
 	// instance finalizer will free memory the table's destructor
 	// will also reclaim → double-free against the wasm allocator.
+	// The bridge emits the runtime-gated clearPtr today; this guards
+	// against a regression.
 	if col.ptr != 0 {
 		t.Errorf("AddColumn2(col, is_owned=true): col.ptr must be 0 to prevent double-free; "+
-			"got %d. Fix is upstream in wasmify (issues/runtime-conditional-ownership.md).",
+			"got %d. The runtime-gated clearPtr emit regressed.",
 			col.ptr)
 	}
 
@@ -398,8 +399,9 @@ func TestLifetime_RuntimeConditionalOwnership_AddColumnTrue(t *testing.T) {
 	// loud failure. If Phase 1 already cleared col.ptr, free() is a
 	// no-op and the probe runs cleanly. If Phase 1 found col.ptr set,
 	// the finalizer here issues a Free RPC against owned memory and
-	// the probe traditionally crashes with wazero "out of bounds
-	// memory access" or a corrupt allocator state.
+	// the probe traditionally crashes with the transpiled wasm2go
+	// module reporting "out of bounds memory access" or a corrupt
+	// allocator state.
 	col = nil
 	for i := 0; i < 10; i++ {
 		runtime.GC()
@@ -480,7 +482,8 @@ func TestLifetime_AnalyzerOutputKeepAlive(t *testing.T) {
 	}
 
 	// Force a method call that reads through the resolved tree —
-	// will SIGSEGV inside wazero if any input was finalised.
+	// will SIGSEGV inside the transpiled wasm2go module if any input
+	// was finalised.
 	stmt, err := out.ResolvedStatement()
 	if err != nil {
 		t.Fatalf("AnalyzerOutput.ResolvedStatement after inputs dropped: %v", err)

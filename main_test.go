@@ -10,9 +10,9 @@ import (
 )
 
 // TestMain initialises the wasm2go runtime once before any test runs.
-// The generated bindings ship as a dual-arch (amd64.s / arm64.s +
-// pure-Go fallback) module pulled in via go.mod, so Init takes no
-// arguments and there is no Close to call.
+// The engine is ahead-of-time transpiled pure-Go via googlesqlwasm2go
+// (pulled in via go.mod), so Init takes no arguments and there is no
+// Close to call.
 func TestMain(m *testing.M) {
 	if err := googlesql.Init(); err != nil {
 		fmt.Fprintf(os.Stderr, "wasm init failed: %v\n", err)

@@ -25,7 +25,7 @@ package googlesql
 //      Module.pendingFrees, drained by the next top-level invoke
 //      while m.mu is held and no activation is suspended mid-call
 //      (the mid-callback-window hazard for FromImpl users);
-//   3. invoke nudges runtime.GC() after every gcNudgePages of linear
+//   3. invoke nudges runtime.GC() after every gcNudgeBytes of linear
 //      memory growth, bounding the ratchet far below the 4 GiB
 //      MaxMem wall.
 

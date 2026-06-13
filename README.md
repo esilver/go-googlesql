@@ -166,8 +166,8 @@ _ = resolved
 ## Verifying provenance
 
 You can re-run the upstream attestation check yourself, locally and
-**without a GitHub access token**, when `googlesql.go` is byte-for-byte
-the upstream release artifact:
+**without a GitHub access token**. It verifies a freshly downloaded
+upstream release artifact, not this fork's patched `googlesql.go`:
 
 ```sh
 make googlesql

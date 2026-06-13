@@ -78,8 +78,9 @@ func TestSimpleTableAddColumn_TransfersOwnership(t *testing.T) {
 	runtime.GC()
 
 	// Sanity: the parent should still serve accessors. If the
-	// double-free corrupted the heap, this is where wazero typically
-	// trips (vtable read against freed memory).
+	// double-free corrupted the heap, this is where the transpiled
+	// wasm2go module typically trips (vtable read against freed
+	// memory).
 	name, err := tbl.Name()
 	if err != nil {
 		t.Fatalf("tbl.Name after GC: %v", err)
