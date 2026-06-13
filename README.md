@@ -182,8 +182,8 @@ the trusted signer to
 `goccy/googlesql-wasm/.github/workflows/build.yml`, so only files
 produced by that workflow verify successfully.
 
-Both checks run unauthenticated — no `gh auth login`, no `GH_TOKEN` /
-`GITHUB_TOKEN` (technique from
+Both the bundle fetch and `gh attestation verify` run unauthenticated,
+with no `gh auth login` and no `GH_TOKEN` / `GITHUB_TOKEN` (technique from
 <https://zenn.dev/shunsuke_suzuki/articles/gh-at-verify-without-access-token>).
 This fork patches `googlesql.go`, so the checked-in file cannot pass
 that upstream attestation check: its digest is intentionally not one of
