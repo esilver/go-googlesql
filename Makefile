@@ -9,7 +9,7 @@ UPSTREAM_BRIDGE_FILE := $(UPSTREAM_DIR)/$(BRIDGE_FILE)
 RELEASE_URL       = https://github.com/$(GOOGLESQL_WASM_REPO)/releases/download/$(GOOGLESQL_WASM_VERSION)
 ATTESTATION_API   = https://api.github.com/repos/$(GOOGLESQL_WASM_REPO)/attestations
 
-.PHONY: googlesql download-upstream verify-upstream download verify test
+.PHONY: googlesql download-upstream verify-upstream verify-patch download verify test
 
 ## googlesql: fetch the upstream wasm2go bridge into .upstream/
 ## and verify its GitHub artifact attestation. This target is
@@ -54,3 +54,20 @@ verify: verify-upstream
 ## test: run the Go test suite.
 test:
 	go test -short ./...
+
+## verify-patch: prove googlesql.go == the upstream bridge baseline plus the
+## downstream patch set in patches/, byte for byte. No network: it uses the
+## 'upstream' git ref the patches were generated against. If missing, run
+## `git remote add upstream https://github.com/goccy/go-googlesql && git fetch upstream`.
+verify-patch:
+	@set -eu; \
+	git rev-parse --verify -q upstream/main >/dev/null \
+	  || { echo "need upstream/main: git remote add upstream https://github.com/goccy/go-googlesql && git fetch upstream" >&2; exit 1; }; \
+	tmp=$$(mktemp -d); trap 'rm -rf $$tmp' EXIT; \
+	git show upstream/main:$(BRIDGE_FILE) > $$tmp/$(BRIDGE_FILE); \
+	( cd $$tmp && git apply -p1 $(CURDIR)/patches/*.patch ); \
+	if diff -q $$tmp/$(BRIDGE_FILE) $(BRIDGE_FILE) >/dev/null; then \
+	  echo "verify-patch OK: $(BRIDGE_FILE) == upstream/main + patches/"; \
+	else \
+	  echo "verify-patch FAIL: bridge diverges from baseline + patches/" >&2; exit 1; \
+	fi

@@ -29,9 +29,14 @@ native toolchain, no embedded wasm runtime, just a regular Go library.
 - **Generated engine, patched bridge.** The transpiled engine is
   consumed through
   [`github.com/goccy/googlesqlwasm2go`](https://github.com/goccy/googlesqlwasm2go).
-  This fork carries a small downstream patch set in `googlesql.go`
-  for bridge lifetime and large-memory behavior until those changes
-  can move upstream into the generator or release artifact.
+  This fork carries a downstream patch set in `googlesql.go` for bridge
+  lifetime and large-memory behavior, expressed as unified diffs under
+  `patches/` and provable with `make verify-patch` (the upstream baseline
+  plus the patches equals the checked-in bridge, byte for byte). The diff
+  is dominated by one mechanical `free()`-body substitution. The
+  substantive logic is small and is described in
+  [UPSTREAMING.md](UPSTREAMING.md). The goal is to move these into the
+  generator so they regenerate cleanly.
 - **End-to-end provenance for upstream release artifacts.** Every
   upstream generated artifact is signed with
   [GitHub artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations).
