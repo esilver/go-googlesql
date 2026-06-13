@@ -18,3 +18,17 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go test -short ./...
+
+  large-memory-regression:
+    name: Large-memory bridge regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOMAXPROCS: 2
+      GOMEMLIMIT: 5GiB
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test -count=1 -timeout 15m -run '^TestIssue16_HeapPast2GiB_BridgePointerSignedness$' .
