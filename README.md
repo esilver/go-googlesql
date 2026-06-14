@@ -14,12 +14,8 @@ Pure-Go bindings for [GoogleSQL](https://github.com/google/googlesql), the SQL d
 ## Features
 
 - **Pure Go, no cgo, no wasm runtime.** The engine is transpiled wasm-to-Go ahead of time and shipped as the [`googlesqlwasm2go`](https://github.com/goccy/googlesqlwasm2go) module, with no embedded interpreter or JIT.
-- **Generated engine, patched bridge.** This fork carries a downstream patch set in `googlesql.go` for bridge lifetime and large-memory behavior, published as unified diffs under `patches/`. The diff is dominated by one mechanical `free()`-body substitution, so the reviewable logic is small. See [UPSTREAMING.md](UPSTREAMING.md).
+- **Generated engine, patched bridge.** This fork carries a downstream patch set in `googlesql.go` for bridge lifetime and large-memory behavior, published as unified diffs under `patches/`. See [UPSTREAMING.md](UPSTREAMING.md).
 - **Verified provenance.** Every upstream generated artifact is signed with [GitHub artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations). `make googlesql` downloads and verifies the upstream bridge against the signed release (see [Verifying provenance](#verifying-provenance)).
-
-## Status
-
-Tracks GoogleSQL revision [`36dd14a`](https://github.com/google/googlesql/commit/36dd14aa0657ea299725504bc0f938732f58f380) (2026-01-31), and new upstream revisions are picked up as they land. The module path stays `github.com/goccy/go-googlesql` for compatibility. This fork is consumed by [`esilver/googlesqlite`](https://github.com/esilver/googlesqlite) and [`esilver/bigquery-emulator`](https://github.com/esilver/bigquery-emulator) through replace directives while the bridge-lifetime and large-memory fixes remain downstream.
 
 ## Installation
 
@@ -27,7 +23,7 @@ Tracks GoogleSQL revision [`36dd14a`](https://github.com/google/googlesql/commit
 go get github.com/goccy/go-googlesql
 ```
 
-The first build is heavy: the engine ships as transpiled Go source plus a large generated bridge in `googlesql.go`, so a cold build needs several gigabytes of RAM and a couple of minutes. See [Resource footprint](#resource-footprint) for measured numbers.
+The first build is heavy, see [Resource footprint](#resource-footprint) below.
 
 ## Synopsis
 
@@ -76,6 +72,10 @@ resolved, _ := out.ResolvedStatement()
 fmt.Printf("resolved statement: %T\n", resolved)
 ```
 
+## Status
+
+Tracks GoogleSQL revision [`36dd14a`](https://github.com/google/googlesql/commit/36dd14aa0657ea299725504bc0f938732f58f380) (2026-01-31), and new upstream revisions are picked up as they land. The module path stays `github.com/goccy/go-googlesql` for compatibility. This fork is consumed by [`esilver/googlesqlite`](https://github.com/esilver/googlesqlite) and [`esilver/bigquery-emulator`](https://github.com/esilver/bigquery-emulator) through replace directives while the bridge-lifetime and large-memory fixes remain downstream.
+
 ## Verifying provenance
 
 Two distinct checks cover different files. `make verify-upstream` attests a freshly downloaded upstream artifact against GitHub's signed release. `make verify-patch` proves this fork's checked-in bridge is exactly that upstream baseline plus the published patches. The patched `googlesql.go` is not a signed release artifact, so it only passes the second check.
@@ -85,8 +85,8 @@ Two distinct checks cover different files. `make verify-upstream` attests a fres
 
 ## Caveats
 
-- **Heavy first build.** The generated bridge needs several gigabytes of RAM and a couple of minutes for a cold compile (see [Resource footprint](#resource-footprint)). The cost is Go compile time, not runtime: `Init` is fast and the steady-state heap is small.
-- **Large-memory regression test.** One regression test intentionally allocates past 2 GiB to guard the large-linear-memory bridge behavior. Use `go test -short ./...` for a low-memory smoke run. CI runs the large-memory regression as a separate resource-capped job. Run the full suite on a host with enough disk and memory when validating broader large-memory changes.
+- **Heavy first build.** See [Resource footprint](#resource-footprint). Use `go test -short ./...` for a low-memory smoke run.
+- **Large-memory regression test.** One regression test intentionally allocates past 2 GiB to guard the large-linear-memory bridge behavior. CI runs the large-memory regression as a separate resource-capped job. Run the full suite on a host with enough disk and memory when validating broader large-memory changes.
 
 ## Resource footprint
 
