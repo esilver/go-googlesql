@@ -200,11 +200,11 @@ generated bridge when validating broader large-memory changes.
 
 ## Resource footprint
 
-Because GoogleSQL ships as ahead-of-time transpiled Go (through the
-`github.com/goccy/googlesqlwasm2go` module) instead of a wasm module
-plus a runtime, the cost shifts from process startup to the Go
-toolchain: compilation is heavier than a typical dependency, but in
-exchange `googlesql.Init` is fast and the steady-state heap is small.
+GoogleSQL ships as ahead-of-time transpiled Go (through the
+`github.com/goccy/googlesqlwasm2go` module), so the cost shifts from
+process startup to the Go toolchain: compilation is heavier than a
+typical dependency, but in exchange `googlesql.Init` is fast and the
+steady-state heap is small.
 
 All numbers below were measured on the same host:
 

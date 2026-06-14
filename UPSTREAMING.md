@@ -14,10 +14,11 @@ The bulk of `26ec027`'s diff (~1441 hunks) is one mechanical substitution
 applied to every generated `free()` body. The genuinely reviewable logic is
 about 7 hunks in `googlesql.go` (the invoke request copy, the two
 `handleCallback` copies, `resolveTypeName`, the `pendingFrees` queue and its
-drain, and the GC nudge) plus the 8 lines in `3bdff21`. Review those, not the
-3,000-line full diff.
+drain, and the GC nudge) plus the 8 lines in `3bdff21`. Those ~15 hunks are the
+whole review surface, and the remaining ~3,000 lines are the mechanical
+`free()`-body substitution.
 
-## Fix 1 - linear memory past 2GiB crashes the bridge (the headline)
+## Fix 1 - linear memory past 2GiB crashes the bridge (highest priority)
 
 - **Symptom:** `panic: slice bounds out of range [-2147066416:]` at
   `googlesql.go:624` on the runtime-finalizer goroutine under distinct-statement
@@ -53,7 +54,7 @@ drain, and the GC nudge) plus the 8 lines in `3bdff21`. Review those, not the
 - **Generator change:** emit `enqueueFree(...)` instead of
   `module().invoke(...)` in `free()` bodies.
 
-## Fix 3 - bound the heap ratchet
+## Fix 3 - bound the heap growth (the "ratchet")
 
 - **Symptom:** un-finalized C++ garbage ratchets the Go heap toward the 4GiB
   MaxMem wall. The `Memory` backing array counts as live Go heap, so GOGC's
@@ -61,10 +62,10 @@ drain, and the GC nudge) plus the 8 lines in `3bdff21`. Review those, not the
 - **Fix:** `invoke` forces `runtime.GC()` every 256MiB of observed
   linear-memory growth, bounding the ratchet far below the wall.
 - **Note:** this is a heuristic and a tradeoff (a stop-the-world GC on the hot
-  path) bought for ratchet containment in a long-lived process. Present it as a
-  labeled follow-up, separate from Fix 1, not bundled into the headline.
-- **Stress:** `TestIssue16_FinalizerOptionChurnStress` (8 goroutines by 120
-  distinct-text analyses with forced GC) is green.
+  path) bought for ratchet containment in a long-lived process. It is a
+  self-contained follow-up, independent of Fix 1.
+- **Stress:** `TestIssue16_FinalizerOptionChurnStress` (8 goroutines, each
+  running 120 distinct-text analyses, with forced GC) passes.
 
 ## Fix 4 - keep TVF wrappers alive through base handles (`3bdff21`)
 
@@ -72,8 +73,8 @@ drain, and the GC nudge) plus the 8 lines in `3bdff21`. Review those, not the
   `TableValuedFunction` wrapper still references it.
 - **Fix:** insert `h.TableValuedFunction.setKeepAlive(h)` in the TVF
   constructors (8 insertions across the subclass types and their NoFinalizer
-  variants). `setKeepAlive` already exists upstream structurally, so this is a
-  lifetime-wiring fix, not a new mechanism.
+  variants). `setKeepAlive` already exists upstream structurally, so this fix
+  only wires up existing lifetime machinery.
 - **Guard:** `binding_e2e_test.go` forces GC on the extract-base path.
 
 ## How to present this upstream
@@ -81,5 +82,5 @@ drain, and the GC nudge) plus the 8 lines in `3bdff21`. Review those, not the
 Lead with Fix 1: an unconditional correctness bug with a deterministic repro
 that reproduces on upstream's current bridge with no regression test guarding
 it. Treat Fixes 2-4 as a labeled follow-up. The ask is to emit these from the
-generator so they regenerate cleanly rather than living as hand-edits to a
-generated file.
+generator so they regenerate cleanly and stay out of the hand-edited generated
+file.
