@@ -19,7 +19,7 @@ import (
 // both children through `FullName` (the only side-effect-free
 // observable on `MultiCatalog`).
 func TestBindingGap_MultiCatalogCreate(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	c1, err := googlesql.NewSimpleCatalog("alpha", nil)
 	if err != nil {
@@ -59,7 +59,7 @@ func TestBindingGap_MultiCatalogCreate(t *testing.T) {
 // the bridge filter dropped any method whose signature mentioned
 // `google::protobuf::Descriptor*`.
 func TestBindingGap_MakeProtoTypeSurfaceExists(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	tf, err := googlesql.NewTypeFactory()
 	if err != nil {
@@ -153,7 +153,7 @@ func equalStrings(a, b []string) bool {
 // stored fields back through the C++ accessors, and asserts the
 // values round-trip exactly.
 func TestBindingGap_SimpleGraphPropertyDeclaration(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	_, int64Type := makeInt64Type(t)
 
@@ -188,7 +188,7 @@ func TestBindingGap_SimpleGraphPropertyDeclaration(t *testing.T) {
 // property declarations through the constructor, then asks the
 // element label to expose them back via `GetPropertyDeclarations`.
 func TestBindingGap_SimpleGraphElementLabel(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	_, int64Type := makeInt64Type(t)
 	decl1, err := googlesql.NewSimpleGraphPropertyDeclaration("count", []string{"g"}, int64Type)
@@ -237,7 +237,7 @@ func TestBindingGap_SimpleGraphElementLabel(t *testing.T) {
 // builds a node table on top of it, then reads back the configured
 // fields through the C++ accessors.
 func TestBindingGap_SimpleGraphNodeTable(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	_, int64Type := makeInt64Type(t)
 
@@ -314,7 +314,7 @@ func TestBindingGap_SimpleGraphNodeTable(t *testing.T) {
 // existing `paramTakesOwnership` + `handleArgExpr` ownership-
 // transfer path that Bug #5C's vector counterpart parallels.
 func TestBindingGap_SimpleGraphEdgeTable(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	_, int64Type := makeInt64Type(t)
 
@@ -466,7 +466,7 @@ func (m *myTVFCallback) Resolve(
 // the C++-owned instance must round-trip through the Go callback —
 // proving the C++→Go virtual dispatch is wired end-to-end.
 func TestBindingGap_TableValuedFunctionFromImpl(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	// Build a minimal FunctionSignature so we have a non-nil arg to
 	// forward through the trampoline ctor; the analyzer is not
@@ -549,7 +549,7 @@ func TestBindingGap_TableValuedFunctionFromImpl(t *testing.T) {
 // cover (return-of-handle vs return-of-string-list are different
 // proto wire shapes).
 func TestBindingGap_TableValuedFunctionResolveCallback(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	sigOpts, err := googlesql.NewFunctionSignatureOptions()
 	if err != nil {
@@ -620,11 +620,11 @@ func TestBindingGap_TableValuedFunctionResolveCallback(t *testing.T) {
 // The fix (in protoc-gen-wasmify-go's writeCallbackCaseBody) emits
 // `new<Handle>NoFinalizer(_ptr)` for borrowed inputs. This test
 // repeats the Resolve round-trip inside a closure so the locals
-// become unreachable, drives gc() ten times to flush all
+// become unreachable, drives forceGC() ten times to flush all
 // finalisers, then exercises a wasm export that the corrupted
 // allocator would have crashed on.
 func TestBindingGap_TableValuedFunctionResolveCallback_PostFinalize(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 	(func() {
 		sigOpts, err := googlesql.NewFunctionSignatureOptions()
 		if err != nil {
@@ -660,7 +660,7 @@ func TestBindingGap_TableValuedFunctionResolveCallback_PostFinalize(t *testing.T
 		}
 	})()
 	for i := 0; i < 10; i++ {
-		gc()
+		forceGC()
 	}
 	_, _, _, _ = setupAnalyzer(t)
 }

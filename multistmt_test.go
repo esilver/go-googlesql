@@ -15,7 +15,7 @@ import (
 // comparing the ParseResumeLocation's byte position against the input
 // length after each call; once it reaches the end we stop iterating.
 func TestAnalyzeMultiStatements(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 	catalog, opts, tf, _ := setupAnalyzer(t)
 
 	const sql = "SELECT 1 AS a; SELECT 2 AS b;"

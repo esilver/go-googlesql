@@ -10,7 +10,7 @@ import (
 // TestParser mirrors go-zetasql/parser_test.go: parse a simple SELECT
 // and verify the top-level AST shape is an ASTQueryStatement.
 func TestParser(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	opts, err := googlesql.NewParserOptions()
 	if err != nil {
@@ -32,7 +32,7 @@ func TestParser(t *testing.T) {
 // TestParseStatementError asserts a syntax error surfaces through the
 // Go-facing error.
 func TestParseStatementError(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	opts, err := googlesql.NewParserOptions()
 	if err != nil {
@@ -47,7 +47,7 @@ func TestParseStatementError(t *testing.T) {
 // TestParseMultipleQueries runs a handful of valid statements through
 // the parser to exercise the full dispatch path.
 func TestParseMultipleQueries(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	opts, err := googlesql.NewParserOptions()
 	if err != nil {

@@ -21,9 +21,10 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// gc forces garbage collection so wasm-side handles released via
+// forceGC forces garbage collection so wasm-side handles released via
 // runtime.SetFinalizer are freed between tests sharing the module.
-func gc() {
+// Duplicated as googlesql.forceGC because internal-package tests cannot reach this external-package (googlesql_test) copy.
+func forceGC() {
 	runtime.GC()
 	runtime.GC()
 }

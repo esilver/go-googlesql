@@ -16,7 +16,7 @@ import (
 // go-zetasql TestWalk by asserting every pivotal accessor reaches the
 // expected node type.
 func TestWalk(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	opts, err := googlesql.NewParserOptions()
 	if err != nil {

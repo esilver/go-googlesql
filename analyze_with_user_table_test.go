@@ -18,7 +18,7 @@ import (
 // no callback is involved, the Catalog is C++-side but populated from
 // Go.
 func TestAnalyzeWithUserTable(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 	catalog, opts, tf, _ := setupAnalyzer(t)
 
 	int64Type, err := tf.GetInt64()
@@ -85,7 +85,7 @@ func TestAnalyzeWithUserTable(t *testing.T) {
 // when the query references a table that was not registered on the
 // catalog.
 func TestAnalyzeWithUserTableMissing(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 	catalog, opts, tf, _ := setupAnalyzer(t)
 
 	_, err := googlesql.AnalyzeStatement("SELECT * FROM missing_table", opts, catalog, tf)

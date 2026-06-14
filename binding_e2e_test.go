@@ -20,7 +20,7 @@ import (
 // query references one table from each catalog via a UNION ALL —
 // either side missing would surface as an analyzer error.
 func TestE2E_MultiCatalog_CrossCatalog(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	// Pull AnalyzerOptions / TypeFactory off a setupAnalyzer call;
 	// we don't actually use the SimpleCatalog it returns — the test
@@ -128,7 +128,7 @@ func TestE2E_MultiCatalog_CrossCatalog(t *testing.T) {
 // instead exercises the in-binding constructor + AddOwnedProcedure
 // + analyzer round-trip path.
 func TestE2E_Procedure_Call(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	catalog, opts, tf, langOpts := setupAnalyzer(t)
 
@@ -221,7 +221,7 @@ func (c *catalogWithGraph) FindPropertyGraph2(path []string, options *googlesql.
 // `T*&` codepath the way regular FindTable lookups exercise the
 // `T**` codepath.
 func TestE2E_CatalogCallback_FindPropertyGraph(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	_, opts, tf, _ := setupAnalyzer(t)
 
@@ -250,7 +250,7 @@ func TestE2E_CatalogCallback_FindPropertyGraph(t *testing.T) {
 // graph-table scan. Without all of Bug #5A/B/C this test could not
 // even build the input objects.
 func TestE2E_PropertyGraph_Simple(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	catalog, opts, tf, _ := setupAnalyzer(t)
 
@@ -401,7 +401,7 @@ func (g *goPropertyGraph) GetNodeTables() ([]googlesql.GraphNodeTableNode, error
 // callbacks (Name / NamePath / FindLabelByName / GetNodeTables /
 // GetEdgeTables / GetLabels / GetPropertyDeclarations).
 func TestE2E_PropertyGraph_Callback(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	catalog, opts, tf, _ := setupAnalyzer(t)
 
@@ -511,7 +511,7 @@ func TestE2E_PropertyGraph_Callback(t *testing.T) {
 // (FindMessageTypeByName / FindFileByName), wiring proves the
 // external-class bridging path delivers a usable surface.
 func TestE2E_ProtoEnumTypes_SurfaceWiring(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	_, _, tf, _ := setupAnalyzer(t)
 
@@ -598,7 +598,7 @@ func (p *predictionTVF) Resolve(
 // multi-column TVFRelation (input `x INT64` plus a synthesised
 // `prediction FLOAT64`) so the resolved AST carries both columns.
 func TestE2E_TVFCallback_AnalyzeStatement(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	catalog, opts, tf, _ := setupAnalyzer(t)
 
@@ -688,7 +688,7 @@ func TestE2E_TVFCallback_AnalyzeStatement(t *testing.T) {
 // schema carries the change-stream-shaped (commit_ts TIMESTAMP,
 // change STRING) layout the original plan called out.
 func TestE2E_FixedOutputSchemaTVF(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	catalog, opts, tf, _ := setupAnalyzer(t)
 
@@ -765,7 +765,7 @@ func TestE2E_FixedOutputSchemaTVF(t *testing.T) {
 // This previously crashed in the wasm2go binding/runtime while resolving
 // SELECT ... FROM add_one(41).
 func TestE2E_FixedOutputSchemaTVF_ScalarArgsFromParserAST(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	catalog, opts, tf, _ := setupAnalyzer(t)
 
@@ -815,7 +815,7 @@ func TestE2E_FixedOutputSchemaTVF_ScalarArgsFromParserAST(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFixedOutputSchemaTVF: %v", err)
 	}
-	gc()
+	forceGC()
 	if err := catalog.AddTableValuedFunction2("add_one", tvf); err != nil {
 		t.Fatalf("AddTableValuedFunction2: %v", err)
 	}
@@ -860,7 +860,7 @@ func TestE2E_FixedOutputSchemaTVF_ScalarArgsFromParserAST(t *testing.T) {
 // errors through the MultiCatalog: a query referencing a table that
 // exists in NEITHER child must fail.
 func TestE2E_MultiCatalog_MissingTable(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	_, opts, tf, langOpts := setupAnalyzer(t)
 	bfo := &googlesql.BuiltinFunctionOptions{LanguageOptions: langOpts}

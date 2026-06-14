@@ -27,7 +27,7 @@ func (g *goCatalog) FullName() (string, error) {
 }
 
 func TestCatalogCallback(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	impl := &goCatalog{fullName: "mycatalog"}
 	cat, err := googlesql.NewCatalogFromImpl(impl)

@@ -158,7 +158,7 @@ func TestLifetime_FileDescriptorProto_MergeFromIndependent(t *testing.T) {
 // the FileDescriptor wrapper.
 func TestLifetime_DescriptorPoolBuildFile_PoolPinsResult(t *testing.T) {
 	ensureInit(t)
-	t.Cleanup(gcLocal)
+	t.Cleanup(forceGC)
 
 	pool, err := NewDescriptorPool()
 	if err != nil {
@@ -270,7 +270,7 @@ func appendVarint(buf []byte, v uint64) []byte {
 // post-finalizer allocator probe.
 func TestLifetime_RuntimeConditionalOwnership_AddColumnFalse(t *testing.T) {
 	ensureInit(t)
-	t.Cleanup(gcLocal)
+	t.Cleanup(forceGC)
 
 	tf, err := NewTypeFactory()
 	if err != nil {
@@ -358,7 +358,7 @@ func TestLifetime_RuntimeConditionalOwnership_AddColumnFalse(t *testing.T) {
 // giving a deterministic crash signal if the bug ever returns.
 func TestLifetime_RuntimeConditionalOwnership_AddColumnTrue(t *testing.T) {
 	ensureInit(t)
-	t.Cleanup(gcLocal)
+	t.Cleanup(forceGC)
 
 	tf, err := NewTypeFactory()
 	if err != nil {
@@ -418,10 +418,9 @@ func TestLifetime_RuntimeConditionalOwnership_AddColumnTrue(t *testing.T) {
 	runtime.KeepAlive(tbl)
 }
 
-// gcLocal forces two passes of GC to flush queued finalizers.
-// Identical in behaviour to googlesql_test.gc but accessible from
-// internal-package tests in this file.
-func gcLocal() {
+// forceGC forces two passes of GC to flush queued finalizers.
+// Duplicated from googlesql_test.forceGC because internal-package tests cannot reach the external-package (googlesql_test) copy.
+func forceGC() {
 	runtime.GC()
 	runtime.GC()
 }

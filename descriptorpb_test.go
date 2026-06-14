@@ -149,7 +149,7 @@ func eqFDP(a, b fdpFields) bool {
 // byte order for unset fields, so observable-state equality is the
 // portable contract.
 func TestProtoWire_FileDescriptorProto_RoundTrip(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	want := fdpFields{
 		name:   "example/sample.proto",
@@ -208,7 +208,7 @@ func TestProtoWire_FileDescriptorProto_RoundTrip(t *testing.T) {
 // `descriptorpb.FileDescriptorSet`-shaped helper exists in the
 // public API.
 func TestProtoWire_FileDescriptorSet_RoundTrip(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	wantA := fdpFields{name: "example/a.proto", pkg: "example.a", syntax: "proto3"}
 	wantB := fdpFields{name: "example/b.proto", pkg: "example.b", syntax: "proto3", deps: []string{"example/a.proto"}}
@@ -280,7 +280,7 @@ func TestProtoWire_FileDescriptorSet_RoundTrip(t *testing.T) {
 // succeed (proto3's contract for the empty message), and every
 // optional field must read back as its zero value.
 func TestProtoWire_ParseFromString_Empty(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	fdp, err := googlesql.NewFileDescriptorProto()
 	if err != nil {
@@ -305,7 +305,7 @@ func TestProtoWire_ParseFromString_Empty(t *testing.T) {
 // the wrapper must NOT silently absorb the malformed input as a
 // valid empty proto.
 func TestProtoWire_ParseFromString_Malformed(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	// Tag 1 (name, length-delimited), claimed length 100, but only
 	// 2 bytes of payload follow.

@@ -52,7 +52,7 @@ func (c *catalogWithUsers) FindTable(path []string, options *googlesql.FindOptio
 // actually happened (without this, the test would pass if the
 // resolver found the table via some fallback path).
 func TestAnalyzeWithGoCatalog(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	// Build a SimpleTable the Go impl will hand out on FindTable.
 	// Setup uses the bridged SimpleCatalog only to borrow the

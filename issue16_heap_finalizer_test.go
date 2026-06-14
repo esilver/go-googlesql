@@ -142,7 +142,7 @@ func TestIssue16_HeapPast2GiB_BridgePointerSignedness(t *testing.T) {
 // drain to empty.
 func TestIssue16_FinalizerOptionChurnStress(t *testing.T) {
 	ensureInit(t)
-	t.Cleanup(func() { runtime.GC(); runtime.GC() })
+	t.Cleanup(forceGC)
 
 	catalog, err := NewSimpleCatalog("issue16_catalog", nil)
 	if err != nil {

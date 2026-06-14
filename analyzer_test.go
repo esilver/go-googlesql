@@ -59,7 +59,7 @@ func setupAnalyzer(t *testing.T) (*googlesql.SimpleCatalog, *googlesql.AnalyzerO
 // expose a Column upcast from SimpleColumn — wiring that up is tracked
 // as a follow-up in the plugin.
 func TestAnalyzer(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 	catalog, opts, tf, _ := setupAnalyzer(t)
 
 	out, err := googlesql.AnalyzeStatement("SELECT 1 AS col1, 'hi' AS col2", opts, catalog, tf)
@@ -107,7 +107,7 @@ func TestAnalyzer(t *testing.T) {
 // table surfaces an analyzer-level error (as opposed to a syntax
 // error).
 func TestAnalyzeStatementError(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 	catalog, opts, tf, _ := setupAnalyzer(t)
 	_, err := googlesql.AnalyzeStatement("SELECT * FROM no_such_table", opts, catalog, tf)
 	if err == nil {
@@ -121,7 +121,7 @@ func TestAnalyzeStatementError(t *testing.T) {
 // TestAnalyzeStatementResolved runs analysis on a statement using only
 // built-in types and checks the resolved AST has the expected shape.
 func TestAnalyzeStatementResolved(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 	catalog, opts, tf, _ := setupAnalyzer(t)
 
 	out, err := googlesql.AnalyzeStatement("SELECT 1 AS num, 'hello' AS greeting", opts, catalog, tf)

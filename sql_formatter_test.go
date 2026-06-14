@@ -14,7 +14,7 @@ import (
 // analyzer bazel target this project is built from does not pull in the
 // stand-alone sql_formatter.cc object.
 func TestSQLFormatter(t *testing.T) {
-	t.Cleanup(gc)
+	t.Cleanup(forceGC)
 
 	opts, err := googlesql.NewParserOptions()
 	if err != nil {
