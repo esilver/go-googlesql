@@ -10,13 +10,15 @@ so they survive regeneration.
 
 Commits: `26ec027` (fixes 1-3), `3bdff21` (fix 4).
 
-The bulk of `26ec027`'s diff (~1441 hunks) is one mechanical substitution
-applied to every generated `free()` body. The genuinely reviewable logic is
-about 7 hunks in `googlesql.go` (the invoke request copy, the two
-`handleCallback` copies, `resolveTypeName`, the `pendingFrees` queue and its
-drain, and the GC nudge) plus the 8 lines in `3bdff21`. Those ~15 hunks are the
-whole review surface, and the remaining ~3,000 lines are the mechanical
-`free()`-body substitution.
+The diff splits into three parts. The two logic rows are the whole review
+surface. The mechanical row is a single substitution repeated across every
+generated `free()` body.
+
+| Part            | Size           | What it is                                                                                                  |
+|-----------------|----------------|-------------------------------------------------------------------------------------------------------------|
+| Mechanical      | ~1441 hunks    | One substitution applied to every generated `free()` body (`enqueueFree` for the synchronous destructor call) |
+| Reviewable      | ~7 hunks       | The invoke request copy, the two `handleCallback` copies, `resolveTypeName`, the `pendingFrees` queue and its drain, and the GC nudge |
+| TVF keep-alive  | 8 lines (`3bdff21`) | The `setKeepAlive` wiring in the TVF constructors                                                          |
 
 ## Fix 1 - linear memory past 2GiB crashes the bridge (highest priority)
 
@@ -85,6 +87,12 @@ is consumed via `github.com/goccy/googlesqlwasm2go`, and `googlesql.go` is only
 the generated Go bridge around it.
 
 ### Layout
+
+Two different "upstream" baselines are in play and they are not the same ref:
+the release tag `goccy/googlesql-wasm@v0.3.1` is the attestation baseline (the
+signed artifact `verify-upstream` checks), while the `upstream/main` git ref of
+`goccy/go-googlesql` is the patch baseline (what `patches/` and `verify-patch`
+diff against).
 
 - The canonical upstream bridge is the `googlesql_wasm2go.go` asset from the
   `goccy/googlesql-wasm` release (currently `v0.3.1`), fetched by

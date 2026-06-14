@@ -95,6 +95,9 @@ func main() {
 
 ### Parse a SQL statement
 
+The fragments below build on the `Init` setup above and call `fmt`, so the
+`package`, `import`, and `func main` lines are elided for brevity.
+
 ```go
 opts, err := googlesql.NewParserOptions()
 if err != nil {

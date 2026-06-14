@@ -48,7 +48,10 @@ verify-upstream:
 	  --bundle $$bundle \
 	  --signer-workflow $(GOOGLESQL_WASM_WORKFLOW)
 
+## download: alias for download-upstream.
 download: download-upstream
+## verify: alias for verify-upstream (upstream attestation only). Run
+## verify-patch separately to check the checked-in patched bridge.
 verify: verify-upstream
 
 ## test: run the Go test suite.
