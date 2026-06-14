@@ -9,7 +9,7 @@ import (
 	"github.com/goccy/go-googlesql"
 )
 
-// TestMain initialises the wasm2go runtime once before any test runs.
+// TestMain initialises the transpiled engine once before any test runs.
 // The engine is ahead-of-time transpiled pure-Go via googlesqlwasm2go
 // (pulled in via go.mod), so Init takes no arguments and there is no
 // Close to call.

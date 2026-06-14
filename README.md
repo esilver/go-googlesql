@@ -42,8 +42,8 @@ native toolchain, no embedded wasm runtime, just a regular Go library.
 - **End-to-end provenance for upstream release artifacts.** Every
   upstream generated artifact is signed with
   [GitHub artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations).
-  The `make verify` target can re-verify an unmodified bridge file
-  against the signed upstream release (see
+  The `make googlesql` target downloads the upstream bridge and
+  verifies it against the signed upstream release (see
   [Verifying provenance](#verifying-provenance)).
 
 ## Status

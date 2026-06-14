@@ -147,8 +147,8 @@ func TestLifetime_FileDescriptorProto_MergeFromIndependent(t *testing.T) {
 // dropping the pool while the FileDescriptor wrapper is alive must
 // not free the underlying memory.
 //
-// Now uses the regenerated ParseFromString binding (issues/proto-wire-binding.md
-// landed) to populate the FileDescriptorProto. The test marshals a
+// Uses the regenerated ParseFromString binding to populate the
+// FileDescriptorProto. The test marshals a
 // minimal proto3 file via descriptorpb (in this _test.go's test-only
 // dep), pushes the wire bytes through `ParseFromString`, and feeds
 // the resulting wasm-side FileDescriptorProto into `BuildFile`. The

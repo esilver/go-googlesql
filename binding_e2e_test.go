@@ -345,7 +345,7 @@ func TestE2E_PropertyGraph_Simple(t *testing.T) {
 
 // goPropertyGraph is a Go-implemented PropertyGraph. Important
 // constraint: callback handlers run *inside* the wasm call that
-// triggered them and cannot re-enter the wasm runtime (the module
+// triggered them and cannot re-enter the transpiled engine (the module
 // mutex is already held). The impl therefore returns either:
 //
 //   - pre-built handles to existing C++ objects (looking up a Go
@@ -353,7 +353,7 @@ func TestE2E_PropertyGraph_Simple(t *testing.T) {
 //     materialised for the wire), or
 //   - cached scalar values populated *before* the analyze call.
 //
-// Delegating to wrapped.Name() etc. would deadlock the runtime.
+// Delegating to wrapped.Name() etc. would deadlock the engine.
 type goPropertyGraph struct {
 	googlesql.PropertyGraphCallbackDefaults
 	name     string
