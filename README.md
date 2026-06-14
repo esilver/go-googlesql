@@ -33,12 +33,10 @@ native toolchain, no embedded wasm runtime, just a regular Go library.
   [`github.com/goccy/googlesqlwasm2go`](https://github.com/goccy/googlesqlwasm2go).
   This fork carries a downstream patch set in `googlesql.go` for bridge
   lifetime and large-memory behavior, expressed as unified diffs under
-  `patches/` and provable with `make verify-patch` (the upstream baseline
-  plus the patches equals the checked-in bridge, byte for byte). The diff
-  is dominated by one mechanical `free()`-body substitution. The
-  substantive logic is small and is described in
-  [UPSTREAMING.md](UPSTREAMING.md). The goal is to move these into the
-  generator so they regenerate cleanly.
+  `patches/`. The diff is dominated by one mechanical `free()`-body
+  substitution, so the substantive logic is small. The fixes, how to verify
+  and regenerate the bridge, and the plan to emit them from the generator are
+  all in [UPSTREAMING.md](UPSTREAMING.md).
 - **End-to-end provenance for upstream release artifacts.** Every
   upstream generated artifact is signed with
   [GitHub artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations).
@@ -113,8 +111,10 @@ if err != nil {
 
 // Use a type assertion to reach concrete AST node types.
 queryStmt, ok := stmt.(*googlesql.ASTQueryStatement)
-_ = queryStmt
-_ = ok
+if !ok {
+    panic("expected a query statement")
+}
+fmt.Printf("parsed query: %T\n", queryStmt)
 ```
 
 ### Analyze a SQL statement against a catalog
@@ -129,6 +129,7 @@ langOpts, err := googlesql.NewLanguageOptions()
 if err != nil {
     panic(err)
 }
+// Error handling on the option setters is elided for brevity.
 _ = langOpts.EnableMaximumLanguageFeaturesForDevelopment()
 _ = langOpts.SetSupportsAllStatementKinds()
 
@@ -160,43 +161,53 @@ resolved, err := out.ResolvedStatement()
 if err != nil {
     panic(err)
 }
-_ = resolved
+fmt.Printf("resolved statement: %T\n", resolved)
 ```
 
 ## Verifying provenance
 
-You can re-run the upstream attestation check yourself, locally and
-**without a GitHub access token**. It verifies a freshly downloaded
-upstream release artifact, not this fork's patched `googlesql.go`:
+There are two distinct provenance checks, and they cover different files.
+`verify-upstream` attests a freshly downloaded upstream artifact against
+GitHub's signed release. `verify-patch` proves this fork's checked-in bridge
+is exactly that upstream baseline plus the published patches. The patched
+`googlesql.go` is intentionally not one of the signed release artifacts, so
+it only passes the second check, not the first.
+
+### `make verify-upstream`: upstream artifact attestation
+
+Re-run the upstream attestation check yourself, locally and **without a
+GitHub access token**. `make googlesql` downloads the upstream bridge into
+`.upstream/` without touching this fork's patched `googlesql.go`:
 
 ```sh
 make googlesql
 ```
 
-The Makefile target downloads the upstream bridge into `.upstream/`
-without replacing this fork's patched `googlesql.go`, then fetches the
-upstream SLSA build-attestation bundle from the public
-`/repos/.../attestations/sha256:<digest>` API (anonymously) and hands it
-to `gh attestation verify --bundle`. The `--signer-workflow` flag pins
-the trusted signer to
-`goccy/googlesql-wasm/.github/workflows/build.yml`, so only files
-produced by that workflow verify successfully.
-
-Both the bundle fetch and `gh attestation verify` run unauthenticated,
-with no `gh auth login` and no `GH_TOKEN` / `GITHUB_TOKEN` (technique from
+It fetches the upstream SLSA build-attestation bundle from the public
+`/repos/.../attestations/sha256:<digest>` API (anonymously) and hands it to
+`gh attestation verify --bundle`. The `--signer-workflow` flag pins the
+trusted signer to `goccy/googlesql-wasm/.github/workflows/build.yml`, so only
+files produced by that workflow verify successfully. Both the bundle fetch
+and `gh attestation verify` run unauthenticated, with no `gh auth login` and
+no `GH_TOKEN` / `GITHUB_TOKEN` (technique from
 <https://zenn.dev/shunsuke_suzuki/articles/gh-at-verify-without-access-token>).
-This fork patches `googlesql.go`, so the checked-in file cannot pass
-that upstream attestation check: its digest is intentionally not one of
-the signed release artifacts. `make verify-upstream` remains useful when
-checking a freshly downloaded upstream artifact. CI for this fork runs
-the Go test suite instead.
+
+### `make verify-patch`: checked-in bridge is baseline plus patches
+
+`make verify-patch` re-derives `googlesql.go` from the upstream baseline plus
+`patches/` and diffs the result against the checked-in file. It needs the
+`upstream` git remote. See [UPSTREAMING.md](UPSTREAMING.md) for setup and the
+regeneration workflow. CI for this fork runs the Go test suite rather than the
+upstream attestation check.
+
+## Large-memory regression test
 
 One regression test intentionally allocates past 2 GiB to protect the
 large-linear-memory bridge behavior. Use `go test -short ./...` for a
-low-memory local smoke run; CI keeps that path for the broad suite and
-runs the large-memory regression as a separate resource-capped job. Run
-the full suite manually on a runner with enough disk and memory for the
-generated bridge when validating broader large-memory changes.
+low-memory local smoke run. CI keeps that path for the broad suite and runs
+the large-memory regression as a separate resource-capped job. Run the full
+suite manually on a runner with enough disk and memory for the generated
+bridge when validating broader large-memory changes.
 
 ## Resource footprint
 

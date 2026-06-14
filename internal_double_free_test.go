@@ -19,6 +19,8 @@ import (
 // Each test exercises a different unique_ptr-taking method to guard
 // against an accidental "fixed only for one site" regression.
 
+// Self-init here because TestMain lives in the external googlesql_test
+// package and does not run for in-package (package googlesql) tests.
 var initOnceForTests sync.Once
 
 func ensureInit(t *testing.T) {
