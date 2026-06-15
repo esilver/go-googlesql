@@ -23,6 +23,16 @@ Pure-Go bindings for [GoogleSQL](https://github.com/google/googlesql), the SQL d
 go get github.com/goccy/go-googlesql
 ```
 
+This fork keeps the upstream module path `github.com/goccy/go-googlesql`, so a
+bare `go get` resolves to the upstream bridge without the downstream
+memory-safety patches. To build against this fork, redirect it in your `go.mod`:
+
+```
+replace github.com/goccy/go-googlesql => github.com/esilver/go-googlesql v0.2.4-finalizer.1
+```
+
+The pin advances over time, so match it to the consuming repo's `go.mod`.
+
 The first build is heavy, see [Resource footprint](#resource-footprint) below.
 
 ## Synopsis
