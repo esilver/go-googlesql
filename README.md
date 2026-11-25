@@ -84,7 +84,7 @@ fmt.Printf("resolved statement: %T\n", resolved)
 
 ## Status
 
-Tracks GoogleSQL revision [`36dd14a`](https://github.com/google/googlesql/commit/36dd14aa0657ea299725504bc0f938732f58f380) (2026-01-31), and new upstream revisions are picked up as they land. The module path stays `github.com/goccy/go-googlesql` for compatibility. This fork is consumed by [`esilver/googlesqlite`](https://github.com/esilver/googlesqlite) and [`esilver/bigquery-emulator`](https://github.com/esilver/bigquery-emulator) through replace directives while the bridge-lifetime and large-memory fixes remain downstream.
+Tracks GoogleSQL revision [`36dd14a`](https://github.com/google/googlesql/commit/36dd14aa0657ea299725504bc0f938732f58f380) (2026-01-31), and new upstream revisions are picked up as they land. The module path stays `github.com/goccy/go-googlesql` for compatibility. This fork is consumed by [`esilver/googlesql-duckdb`](https://github.com/esilver/googlesql-duckdb) and [`esilver/bigquery-emulator`](https://github.com/esilver/bigquery-emulator) through replace directives while the bridge-lifetime and large-memory fixes remain downstream.
 
 ## Verifying provenance
 
